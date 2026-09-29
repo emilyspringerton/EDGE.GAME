@@ -28,7 +28,9 @@ LLVM_TOOLCHAIN_ROOT ?= $(HOME)/.local/opt/llvm-toolchain
 LLC := $(LLVM_TOOLCHAIN_ROOT)/usr/lib/llvm-18/bin/llc
 LLVM_LIB_PATH := $(LLVM_TOOLCHAIN_ROOT)/usr/lib/x86_64-linux-gnu:$(LLVM_TOOLCHAIN_ROOT)/usr/lib/llvm-18/lib
 
-.PHONY: client relay run-relay test-e2e clean
+CC_WIN ?= x86_64-w64-mingw32-gcc
+
+.PHONY: client client-windows relay run-relay test-e2e clean
 
 build:
 	mkdir -p build
@@ -36,6 +38,21 @@ build:
 client: build
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -I client/runtime \
 		client/edge_client.c client/runtime/parena_runtime.c -o build/edge_client -lm
+
+# client-windows -- real mingw cross-compile of the same edge_client.c (CI auto-release, S584
+# cont. 3, founder real-time: "get CICD auto releases set up for the game client"). edge_client.c
+# was already written portable against this exact target (#ifdef _WIN32 for winsock2, see its own
+# header comment) -- this target is the first thing that actually EXERCISES that, not just trusts
+# it compiles. -DPARENA_NO_GRAPHICS skips the shared runtime header's unconditional
+# <SDL2/SDL.h> include: edge_client.c is still Phase 1's headless NDJSON test client (no SDL2 UI
+# yet, see its own header comment -- that's Phase 2+), and this sandbox has no SDL2-for-mingw
+# cross-build tree, so pulling in a library nothing calls would need one for no real reason.
+# Native `client` above stays unconditional/unguarded, matching every other consumer of this
+# shared runtime header in this monorepo (PARENA/docs: "unconditionally available, harmless if
+# unused") -- this is a narrow, CI-only carve-out, not a repo-wide convention change.
+client-windows: build
+	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS -I client/runtime \
+		client/edge_client.c client/runtime/parena_runtime.c -o build/edge_client.exe -lws2_32 -lm
 
 # relay -- the real, native PARENA+C server binary. Regenerates both .ll files from their real
 # .prn sources every time (cheap, and keeps the checked-in vendored copies honest), lowers each to

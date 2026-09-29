@@ -30,3 +30,15 @@ that had several real PARENA syntax mistakes and would not have compiled as give
 NORTHSTAR.md's own "The traffic_router module" section for exactly what was wrong and why.
 
 This repo is provisionally named and local-only (no GitHub upstream yet).
+
+**CI/auto-release is written and locally verified, not yet running for real.** `.github/workflows/
+ci.yml` builds + tests the client and relay on Linux (`make client`, `make relay`, `make
+test-e2e`), cross-compiles `edge_client.c` for Windows via mingw (`make client-windows` —
+real-verified: a clean `-Wall -Wextra -pedantic -Werror` PE32+ binary, since that file was already
+written portable against `_WIN32`/winsock2 but this was the first time that path was actually
+exercised), bundles a flat `edge_client_windows.zip` (exe + `PLAY.bat`), and auto-tags/releases on
+every green `main` push — same pattern `DEADWEIGHT_2/.github/workflows/ci.yml` already proves live.
+Honest scope note: `edge_client.c` is still Phase 1's headless NDJSON test client, not the real
+SDL2 game window (that's still Phase 2+, see `NORTHSTAR.md`) — so the Windows zip has no
+`SDL2.dll` yet, because nothing links it. Because this repo has no GitHub remote yet, the workflow
+cannot actually run until one exists — created and pushed, not run in CI, until then.

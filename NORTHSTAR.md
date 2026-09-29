@@ -452,9 +452,35 @@ code changes (above); the relay handles making the embedded toolchain DO somethi
 - **Phase 6 — real cabinet-light firmware** for the Nano/Feather (beyond the existing `blink.prn`
   demo), using `traffic_router.prn`'s own routing decisions. Compile-verifiable in this sandbox
   today (no physical board needed to prove it builds); flashing needs the founder's real hardware.
-- **Phase 7 — CI Windows cross-compile + release artifact** (same D2 flat-zip pattern, extended to
-  carry the bundled toolchain too), so "ship a new binary, founder downloads and runs it" is a real
-  one-command release, not a manual build.
+- **Phase 7 — CI Windows cross-compile + release artifact — written and locally verified,
+  2026-09-29 (founder real-time: "get CICD auto releases set up for the game client ensure we have
+  windows zip files with sdl and play.bat and the exe").** `.github/workflows/ci.yml` ported
+  directly from `DEADWEIGHT_2`'s own proven pattern (named above as the recipe to copy, not
+  re-derive): a `version` job auto-bumps a MINOR tag on green `main` pushes; a `build` job
+  installs a sibling PARENA checkout + the no-sudo LLVM toolchain and runs `make client`/`make
+  relay`/`make test-e2e` as the real test gate; a `windows` job cross-compiles via a new
+  `client-windows` Makefile target; a `release` job tags and publishes a GitHub Release. New
+  `scripts/generate_construct.sh` (Principle 21, git-based, same pattern as
+  `DEADWEIGHT_2/scripts/generate_construct.sh`) — verified byte-for-byte deterministic across two
+  local runs. **Real, honest scope decision, resolved via AskUserQuestion rather than guessed:**
+  `client/edge_client.c` is still Phase 1's headless NDJSON test client with zero SDL2 dependency
+  (its own header comment names SDL2 UI as Phase 2+) — bundling `SDL2.dll` into its Windows zip
+  would ship a library nothing calls, so the founder chose shipping CI for the real client as it
+  exists today: `edge_client_windows.zip` is a flat zip (exe + `PLAY.bat`, matching D2's own
+  layout) with no `SDL2.dll`. New `client-windows` Makefile target cross-compiles via
+  `x86_64-w64-mingw32-gcc` with `-DPARENA_NO_GRAPHICS` (skips the shared runtime header's
+  unconditional `<SDL2/SDL.h>` include, since this sandbox has no SDL2-for-mingw tree and nothing
+  in this binary calls it) — a narrow, CI-only carve-out, not a repo-wide convention change; the
+  native `client` target is untouched. **Live-verified, not assumed**: ran the exact mingw
+  invocation locally first (`-Wall -Wextra -pedantic -Werror` clean, produced a real
+  `PE32+ executable ... for MS Windows`) before writing it into CI. **Real, named blocker, not
+  silently worked around**: this repo has no GitHub remote yet (confirmed — `git remote -v` is
+  empty), and the one available `GITHUB_TOKEN` (`EMILY/var/emily-secrets.env`) returns HTTP 403 on
+  a real repo-creation attempt (read-only scope, same limitation already on file for other repo
+  work) — creating the upstream is the founder's own step, matching this repo's own row in the
+  root `CLAUDE.md` ("local repo — no upstream yet — founder creates it"). The workflow is written,
+  committed, and ready to run the moment a remote exists; it has not actually executed on GitHub
+  Actions.
 
 **Production/Android arm (parallel to Phases 0-7 above, not sequenced after them — separate
 platform, separate concern):**

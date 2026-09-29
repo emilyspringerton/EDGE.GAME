@@ -1,0 +1,193 @@
+name: EDGE.GAME CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: write
+
+# Serialize runs per ref: parallel pushes could both compute the same next tag and race each
+# other publishing it (DEADWEIGHT/D2 both hit this for real). Queued (not cancelled) so each run
+# sees the previous run's tag.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+# S584 cont. 3, founder real-time: "get CICD auto releases set up for the game client ensure we
+# have windows zip files with sdl and play.bat and the exe." Scoped honestly, not to the letter of
+# "with sdl": client/edge_client.c is still Phase 1's headless NDJSON test client (no SDL2 UI --
+# that's named Phase 2+ in its own header comment), so there is nothing SDL2 to bundle yet. This
+# ships CI/auto-release for the real client that exists today (exe + PLAY.bat, no SDL2.dll since
+# nothing links it) rather than faking a dependency; swap in a real SDL2 window later without
+# redoing this pipeline. Windows job proves the mingw cross-compile for real (edge_client.c was
+# already written portable against _WIN32/winsock2 but this was never actually exercised until
+# now).
+#
+# Every green push to main auto-bumps the MINOR version, tags, and cuts a GitHub Release
+# (edge_client, edge_relay, edge_client_windows.zip, EDGE_GAME_CONSTRUCT.txt) -- same pattern
+# DEADWEIGHT_2's own ci.yml already established (see root CLAUDE.md Principle 21).
+jobs:
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] && [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+            if [ -z "$latest" ]; then major=0; minor=0; else
+              ver="${latest#v}"; major="$(echo "$ver" | cut -d. -f1)"; minor="$(echo "$ver" | cut -d. -f2)"; fi
+            tag="v${major}.$((minor + 1)).0"
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build + test (Linux)
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # libsdl2-dev is needed even for this graphics-free client: the shared
+      # client/runtime/parena_runtime.h includes <SDL2/SDL.h> unconditionally by design
+      # ("unconditionally available, harmless if unused" -- PARENA_NO_GRAPHICS is opt-in only,
+      # see the header's own comment), and the native `client`/`relay` Makefile targets don't
+      # pass that flag.
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libsdl2-ttf-dev
+
+      - name: Build client
+        run: make client
+
+      # relay/test-e2e need a sibling PARENA checkout with `parena` built, plus the real, no-sudo
+      # LLVM toolchain PARENA/docs/LLVM_BACKEND_NORTHSTAR.md documents acquiring -- both real,
+      # genuine build-from-source steps here, not assumed present the way this sandbox's own
+      # already-vendored toolchains are.
+      - name: Checkout PARENA (sibling, for relay build)
+        uses: actions/checkout@v4
+        with:
+          repository: emilyspringerton/PARENA
+          path: PARENA
+      - name: Build parena compiler
+        run: cd PARENA && make build
+      - name: Acquire no-sudo LLVM/clang toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/opt/llvm-toolchain"
+          cd /tmp
+          for pkg in llvm-18 clang-18 libllvm18 libclang-cpp18 libclang1-18 libobjc4 llvm-18-linker-tools; do
+            apt-get download "$pkg" 2>/dev/null || true
+          done
+          for deb in *.deb; do
+            [ -f "$deb" ] && dpkg -x "$deb" "$HOME/.local/opt/llvm-toolchain"
+          done
+      - name: Build relay
+        run: |
+          LLVM_TOOLCHAIN_ROOT="$HOME/.local/opt/llvm-toolchain" make relay
+      - name: Run make test-e2e
+        run: |
+          LLVM_TOOLCHAIN_ROOT="$HOME/.local/opt/llvm-toolchain" make test-e2e
+
+      - name: Generate Source Construct
+        run: |
+          set -euo pipefail
+          bash scripts/generate_construct.sh EDGE_GAME_CONSTRUCT.txt
+          bash scripts/generate_construct.sh EDGE_GAME_CONSTRUCT.txt.check
+          if ! cmp EDGE_GAME_CONSTRUCT.txt EDGE_GAME_CONSTRUCT.txt.check; then
+            echo "ERROR: CONSTRUCT not deterministic!"
+            diff EDGE_GAME_CONSTRUCT.txt EDGE_GAME_CONSTRUCT.txt.check || true
+            exit 1
+          fi
+          rm EDGE_GAME_CONSTRUCT.txt.check
+
+      - name: Stage release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p release_bin
+          cp build/edge_client release_bin/
+          cp build/edge_relay release_bin/
+          cp EDGE_GAME_CONSTRUCT.txt release_bin/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EDGE_GAME_Release_Bin_${{ github.run_number }}
+          path: release_bin/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows cross-build (mingw)
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 zip
+
+      # -DPARENA_NO_GRAPHICS: see Makefile's own client-windows target comment -- edge_client.c
+      # has no SDL2 UI yet (Phase 2+), and this job has no SDL2-for-mingw tree, so this skips the
+      # shared runtime header's unconditional SDL2 include rather than acquiring a library nothing
+      # calls.
+      - name: Cross-compile edge_client.exe
+        run: make client-windows
+
+      - name: Bundle Windows client (flat zip: exe + PLAY.bat, no SDL2.dll -- nothing links it yet)
+        run: |
+          set -euo pipefail
+          rm -rf pkg/win && mkdir -p pkg/win
+          cp build/edge_client.exe pkg/win/
+          printf '%s\r\n' "start edge_client.exe" > pkg/win/PLAY.bat
+          (cd pkg/win && zip -q ../../edge_client_windows.zip edge_client.exe PLAY.bat)
+
+      - name: Stage release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p release_bin_windows
+          cp edge_client_windows.zip release_bin_windows/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EDGE_GAME_ReleaseWin_Bin_${{ github.run_number }}
+          path: release_bin_windows/*
+          if-no-files-found: error
+
+  release:
+    name: Tag & Release
+    needs: [version, build, windows]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir out
+          cp artifacts/EDGE_GAME_Release_Bin_*/edge_client "out/edge_client_linux_x86_64"
+          cp artifacts/EDGE_GAME_Release_Bin_*/edge_relay "out/edge_relay_linux_x86_64"
+          cp artifacts/EDGE_GAME_Release_Bin_*/EDGE_GAME_CONSTRUCT.txt out/
+          cp artifacts/EDGE_GAME_ReleaseWin_Bin_*/edge_client_windows.zip out/
+          # Create the tag server-side via the release API (--target). A plain `git push origin
+          # $TAG` from the runner is rejected ("refusing to allow a GitHub App to create or update
+          # workflow ... without `workflows` permission") because GITHUB_TOKEN treats the workflow
+          # file in history as part of the new ref -- same real gotcha D2's own release job names.
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "$TAG" --generate-notes
