@@ -51,6 +51,27 @@
    the windows computer or usb OTG adapter to the android tablet." This is real, resolved, and adds
    a materially new component — see "Production topology: Android as the execution platform"
    below for the full, consolidated design this resolves into.
+7. Asked for the actual IDE feedback loop to be built (top pane: compile/upload/files/save
+   buttons "like shankpit"; bottom pane: the code editor; a non-blocking socket open to editor
+   events; the server can send events to the editor and buttons too; a debug mode for direct pin
+   access via an uploaded harness once hardware is attached, explicitly named "a little bit dog
+   foody"; v0 acceptance bar is blinking a light from the server/operator side end to end; skip a
+   simulator for v0), then, mid-build, corrected the relay's own implementation language three
+   times in a row: "we can run sarena from one of the raspberry pis but we need the serial to work
+   first" (confirms a Pi runs PARENA-editor/notebook tooling, gated on serial) → "oh you need
+   server streaming events for that too like buffered obviously" + "i need you to be able to tell
+   me if the pi booted" (the real, concrete events-channel ask) → "make sure we are using REFLUX
+   for the pub sub" → "also the spotlight bar should be included too this is a real IDE" → "write
+   it in PARENA in what world are we using node for any part of this stack?" → "all of the node
+   stuff gets ported to PARENA" → "why is the server JS? PARENA emits TS what the fuck is
+   happening" → "the backend is written in PARENA and you can dog food burrow into golang if you
+   really need to but i think C on the server is ok i dont know" → "parena really needs to just
+   emit the fucking LLVM code for the server I think i think we eat that tech debt and we get
+   parena binaries going for the server obviously the windows client is C." Resolved: the relay
+   (originally Node.js, a real mistake corrected here) is now a native PARENA+C binary compiled
+   through PARENA's own LLVM target — see "Phase 1.5" below. The IDE feedback loop itself (the
+   embedded editor widget + button bar + socket) is still Phase 2, not yet built — see the real,
+   found fork-divergence and the Spotlight-bar requirement named in "EDGE.GAME as an IDE" below.
 
 ## Access model (resolved, not the default assumption)
 
@@ -242,10 +263,13 @@ still correctly refuses the bad program, just unclearly).
     `apps/lobby/src/main.c`'s own pattern, not the whole lobby app.
 - **`server/`** — a small, new relay (its own process, not folded into IDUNA — this is one
   operator and one physical cabinet, not a many-player game needing per-player identity via
-  `internal/games.Registry`). Holds the one live connection from the running client; exposes an
-  authenticated HTTP API for the operator to send a command down and read the response back.
-  Two separate secrets: an operator token (Claude/CLI side) and a client token (the embedded
-  binary's own credential, so a stray port-scanner can't pose as the cabinet).
+  `internal/games.Registry`). **Rewritten 2026-09-29 (see "Phase 1.5" below): a real native
+  PARENA+C binary (`build/edge_relay`), not Node.js.** Holds the one live connection from the
+  running client; both the cabinet port AND the operator port speak plain TCP + NDJSON (the
+  original HTTP operator API is gone — PARENA has no HTTP-server stdlib, and unifying transports
+  is simpler than inventing one). Three separate secrets: an operator token (Claude/CLI side), a
+  client token (the embedded Windows binary's own credential), and a Pi token (each Raspberry
+  Pi's own boot-announce script) — so a stray port-scanner can't pose as any of the three.
 - **Firmware** (Nano, and the Feather once its chip is confirmed) — plain PARENA scalar decision
   logic (e.g. "what light pattern for event X"), same shape as `examples/avr/blink.prn`, compiled
   via the real, existing `avr-gcc`/`avrdude` pipeline.
@@ -273,10 +297,25 @@ refactored (2026-09-25, "deeply integrate it as a widget") into a real, embeddab
 `editor_widget_create`/`_dispatch_event`/`_render_frame`/`_present`/`_tick_autosave`/`_shutdown` —
 callable by a host process instead of only from one big blocking loop, specifically so it could be
 hosted inside SHANKPIT's own lobby compositor. EDGE.GAME reuses that exact widget API rather than
-spawning the editor as a separate process or forking it a second time. The AVR compile+upload fix
-above (current-file-aware, multi-board-profile-aware) lives in PARENA's own `examples/
-editor_main.c` — EDGE.GAME's fork/embed should pull the FIXED version, not `EDITOR.GAME`'s own
-copy, which still has the older, more broken (zero AVR Makefile targets at all) code.
+spawning the editor as a separate process or forking it a second time.
+
+**Real, found-live correction (2026-09-29): the two forks have diverged, and this section's own
+earlier claim was wrong.** Checked directly (grepped for the actual function DEFINITIONS, not just
+usage): the widget lifecycle functions above exist ONLY in `EDITOR.GAME/examples/editor_main.c` —
+NOT in PARENA's own copy, despite this section previously claiming otherwise. PARENA's own
+`examples/editor_main.c` has the AVR multi-board upload fix (current-file-aware,
+multi-board-profile-aware `compile_and_upload_avr`) but NOT the widget lifecycle refactor;
+`EDITOR.GAME`'s own copy has the widget lifecycle but NOT the AVR fix (confirmed:
+`EDITOR.GAME`'s own `Makefile` has zero `avr-*` targets at all). Neither fork has both. Phase 2's
+own real first step, not yet done, is merging these two divergent copies into one — pulling
+`EDITOR.GAME`'s widget-lifecycle structure as the base and porting PARENA's AVR fix onto it —
+before EDGE.GAME can embed a version with both real capabilities at once.
+
+**Also new, from the founder directly (2026-09-29): "also the spotlight bar should be included too
+this is a real IDE."** The embedded widget must carry PARENA's real Spotlight overlay
+(`stdlib/editor/spotlight.prn`'s own fuzzy file/command search, already real and shipped in the
+editor demo) along with syntax highlighting and the file tree — not a stripped-down shell with only
+Save/Upload/Compile buttons. Named here as a firm Phase 2 requirement, not an optional nice-to-have.
 
 **"the compiler is actually built into the game."** The source `.prn` files live on the founder's
 Windows machine as ordinary local files — but `parena.exe` and a full Windows-native AVR toolchain
@@ -341,6 +380,43 @@ code changes (above); the relay handles making the embedded toolchain DO somethi
   gotcha found and fixed: the shared PARENA runtime needs to be the very first `#include` in any
   file that pulls it in (it defines `_POSIX_C_SOURCE` internally, which only works if set before
   glibc's own headers are first touched) — `edge_client.c`'s original include order broke this.
+- **Phase 1.5 — done (2026-09-29). The relay rewritten in PARENA + C; Node.js removed entirely.**
+  Founder real-time, real-time-corrected twice: "write it in PARENA in what world are we using node
+  for any part of this stack?" → "all of the node stuff gets ported to PARENA" → "make sure we are
+  using REFLUX for the pub sub" → "parena really needs to just emit the fucking llvm code for the
+  server... i think we eat that tech debt... obviously the windows client is C." Real, new PARENA
+  compiler capability added to get there: `src/emit_llvm.c` had **zero FFI mechanism at all**
+  before this (confirmed directly in its own error text: "v0 has no external FFI/math-primitive
+  table yet") — a new `#target {:llvm (inline-llvm "...")}` hatch was added, mirroring the C/Java
+  emitters' own `:c`/`:java` hatches but adapted for LLVM's SSA return convention (see
+  `PARENA/docs/LLVM_BACKEND_NORTHSTAR.md`'s own new dated section for the full compiler-side
+  detail; 19 new tests, 71/71 pass; `make test`: 347/347, zero regressions). A new top-level
+  `(llvm-extern "declare ...")` form was added alongside it for external C-ABI declarations.
+  `stdlib/reflux/reflux.prn` (PARENA's real, existing, multi-repo cross-mod pub/sub log — same
+  API/ABI as SHANKPIT's and IDUNA.GAME's own ports) got a second `:llvm` key added to its existing
+  `#target` maps (zero redesign needed — the file was already pure I32/Unit scalar); a new, narrow,
+  LLVM-target-only module `stdlib/net/tcp_llvm.prn` provides raw `tcp-listen-raw`/`tcp-accept-raw`/
+  `tcp-close-raw` (net/tcp.prn's own higher-level String/Result/Arena-typed wrappers can't reach
+  this target — no struct/Region/String support in LLVM v0 — so this is a deliberately separate,
+  minimal file, not a fork of that one). Real, live, end-to-end build chain, not just unit-tested in
+  isolation: `parena build *.prn -o *.ll` → real `llc -mtriple=x86_64-pc-linux-gnu` → real object
+  code → linked (via plain `gcc`) against a hand-written C host (`server/relay_main.c`, the
+  select()/NDJSON plumbing PARENA's scalar-only v0 genuinely can't express — same "PARENA owns the
+  decision/log, hand-written C owns raw syscalls/buffers" split every other PARENA-mod-island in
+  this monorepo already uses) — one real, standalone `build/edge_relay` binary, zero Node anywhere.
+  New, real events channel on the operator port answering "you need server streaming events for
+  that too like buffered obviously": `events_since`/`events_subscribe` read the SAME real REFLUX
+  ring-buffer log a device's `event` push writes into — buffered (a subscriber that wasn't
+  listening yet still sees it on its next `events_since`) AND live (a subscriber gets pushed new
+  entries as they're dispatched, no polling). `pi/boot_announce.sh` + `pi/
+  edge-boot-announce.service` directly answer "i need you to be able to tell me if the pi booted" —
+  a plain bash `/dev/tcp` one-shot (no curl/python dependency needed on a fresh Pi image),
+  dispatching `REFLUX_ACTION_PI_BOOTED`, live-verified against the real relay binary. `make
+  test-e2e`: rewritten for the new TCP+NDJSON-everywhere protocol, 12/12 checks pass (the original
+  3 routing decisions + generic ack + wrong-token rejection, plus 6 new checks for the events
+  channel). Real, honest, not yet done: no physical Pi exists in this sandbox to verify
+  `edge-boot-announce.service` itself booting for real (only the script's own wire behavior against
+  a live relay is verified) — named, not hidden.
 - **Phase 2 — embed the IDE widget + bundle the toolchain.** Pull EDITOR.GAME's real widget-
   lifecycle API + PARENA's now-fixed `editor_main.c` compile/upload logic into EDGE.GAME's own
   Windows client; acquire and package a verified Windows-native `parena.exe` +
@@ -401,9 +477,12 @@ platform, separate concern):**
 2. **What does the Pi actually run?** A companion Linux program (PARENA-compiled, using the real
    `hw/serial.prn`) the same way EDGE.GAME's Windows client does, or something else entirely
    (an existing off-the-shelf light-controller stack)?
-3. **Transport for client↔server**: this doc defaults to plain TCP + NDJSON (simpler than
-   WebSocket for a C client, no framing library needed) — flag if a browser-facing debug console
-   is wanted soon, which would tip the balance back toward WebSocket.
+3. ~~**Transport for client↔server**~~ — **resolved 2026-09-29 (Phase 1.5).** Plain TCP + NDJSON
+   for both the cabinet port AND the operator port (the original HTTP operator API was dropped
+   when the relay itself was rewritten in PARENA+C — no external framing library needed on the C
+   side, and PARENA has no HTTP-server stdlib to lean on either). Still flag if a browser-facing
+   debug console is wanted later — that would tip the balance back toward WebSocket for that one
+   consumer specifically, not a reason to revisit the cabinet/operator wire format itself.
 4. **Git remote for the pair-programming sync**: does the founder want their local EDGE.GAME
    working copy pushing to/pulling from a repo Claude can already reach (e.g. a real GitHub repo
    once EDGE.GAME has an upstream), or something more local/direct (the relay server itself hosting

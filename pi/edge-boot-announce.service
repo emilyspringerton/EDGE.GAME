@@ -1,0 +1,31 @@
+# pi/edge-boot-announce.service -- runs boot_announce.sh once, after real network connectivity is
+# up (After=network-online.target, not just network.target -- boot_announce.sh needs a real,
+# working route to the relay, not just the interface existing). Install on each Raspberry Pi:
+#
+#   sudo cp pi/boot_announce.sh /usr/local/bin/edge_boot_announce.sh
+#   sudo chmod +x /usr/local/bin/edge_boot_announce.sh
+#   sudo cp pi/edge-boot-announce.service /etc/systemd/system/
+#   # edit the Environment= lines below for this Pi's real host/port/token/id, or drop an
+#   # /etc/default/edge-boot-announce EnvironmentFile instead
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now edge-boot-announce.service
+#
+# Real, honest, not yet verified on real hardware -- written and reviewable, not run on an actual
+# Pi in this sandbox (no Pi exists here). Verified only via a direct bash /dev/tcp invocation
+# against the real relay binary running locally, matching this repo's own established
+# "no-hardware-needed" testing discipline for everything that isn't the physical boards themselves.
+[Unit]
+Description=EDGE.GAME boot-announce (tell the relay this Pi is up)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=EDGE_RELAY_HOST=CHANGE_ME
+Environment=EDGE_RELAY_OPERATOR_PORT=8092
+Environment=EDGE_PI_TOKEN=CHANGE_ME
+Environment=EDGE_PI_ID=1
+ExecStart=/usr/local/bin/edge_boot_announce.sh
+
+[Install]
+WantedBy=multi-user.target

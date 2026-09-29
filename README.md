@@ -6,13 +6,22 @@ both ways — flashing physical lights on the cabinet from an online game, and g
 USB-serial/hardware debugging access without any remote-control software on the Windows machine
 itself.
 
-**Status: one real piece built and tested, the rest is NORTHSTAR.** See
+**Status: several real pieces built and tested, the rest is NORTHSTAR.** See
 [`NORTHSTAR.md`](NORTHSTAR.md) for the full picture: the founder's own resolved access model (no
 Claude Code Remote Control — a binary is built here, downloaded, and run there), the real physical
 hardware topology (Windows PC + Adafruit Feather + Raspberry Pi + Arduino Nano, wired through a
 logic-level shifter), a capability audit of what already exists to reuse (PARENA's real, working
 AVR upload pipeline for the Nano's firmware; SHANKPIT's real controller-input code; DEADWEIGHT_2's
 real Windows cross-compile recipe), and a phased build plan.
+
+**The relay server (`build/edge_relay`) is a real, native PARENA+C binary — no Node.js anywhere in
+this stack.** It links genuine object code compiled from `PARENA/stdlib/reflux/reflux.prn` (the
+event pub/sub log) and `PARENA/stdlib/net/tcp_llvm.prn` (raw socket lifecycle) through PARENA's own
+LLVM emission target, plus a thin hand-written C host for the parts that target's v0 can't express
+(the select() event loop, NDJSON line framing). Both the cabinet connection and the operator API
+are plain TCP + NDJSON. A live events channel (buffered + streaming, backed by the real REFLUX
+ring-buffer) lets a Raspberry Pi announce its own boot over the network (`pi/boot_announce.sh`).
+`make test-e2e` (12/12 checks, no hardware needed) is the real, reproducible proof.
 
 `PARENA/stdlib/edge_game/traffic_router.prn` — the cabinet's hardware fan-out routing decision
 logic — is real, built, and tested (`make test-traffic-router` in `PARENA/`, 4/4 assertions,
