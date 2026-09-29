@@ -311,6 +311,21 @@ own real first step, not yet done, is merging these two divergent copies into on
 `EDITOR.GAME`'s widget-lifecycle structure as the base and porting PARENA's AVR fix onto it —
 before EDGE.GAME can embed a version with both real capabilities at once.
 
+**Resolved, 2026-09-29: the two forks are merged.** `EDITOR.GAME/examples/editor_main.c` now
+carries both real capabilities in one file — the widget lifecycle API (unchanged) plus PARENA's
+current-file/`EDGE_AVR_UPLOAD_TARGET`-board-profile-aware `compile_and_upload_avr`, ported
+verbatim except for one deliberate adaptation: since `EDITOR.GAME` has no `examples/avr/` tree or
+AVR toolchain of its own, the merged function delegates the real build+flash to a sibling
+`../PARENA` checkout (`make -C ../PARENA <target> AVR_PRN_SOURCE=<abs path>`), the same
+sibling-checkout dependency that repo's own `make regenerate` already has. Live-verified headless
+end to end (real Upload-button click on a non-PARENA-tree `.prn` file → real `parena build` →
+`avr-gcc` → `avr-objcopy` → `avrdude`, failing only at avrdude's port-open step, no physical board
+in this sandbox). `EDITOR.GAME@0f7bca5`, Apple #21354. See `EDITOR.GAME/NORTHSTAR.md`'s own "Fork
+divergence found and merged" section for the full detail. EDGE.GAME can now embed this fork's
+widget API without losing the AVR fix — the actual embedding into EDGE.GAME itself (the button
+bar + editor pane + non-blocking socket loop that was this thread's original ask) is still Phase
+2's own next, not-yet-started step.
+
 **Also new, from the founder directly (2026-09-29): "also the spotlight bar should be included too
 this is a real IDE."** The embedded widget must carry PARENA's real Spotlight overlay
 (`stdlib/editor/spotlight.prn`'s own fuzzy file/command search, already real and shipped in the
