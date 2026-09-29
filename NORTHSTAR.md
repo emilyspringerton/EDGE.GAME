@@ -178,11 +178,13 @@ Windows/dev arm exactly as scoped. This section is additive: a second, parallel 
   the same exact gap `SPIDERBEETLE/NORTHSTAR.md` already found and named. An Android client here
   can be scoped and its source written, but not built or run in this sandbox — needs the founder's
   own machine or a real CI Android-SDK runner, same as every other Android work in this monorepo.
-- **No USB-OTG-serial code exists anywhere in this monorepo today** — checked directly (grepped
-  for `UsbManager`/`UsbSerialPort`/OTG across every `.kt`/`.java`/`.md` file, zero real hits). This
-  is genuinely new work on the Android side: Android's `UsbManager` device-permission dance plus
-  either a hand-rolled bulk-transfer driver or the common third-party `usb-serial-for-android`
-  library (real and widely used, not yet evaluated or vetted for this project).
+- **No USB-OTG-serial code existed anywhere in this monorepo as of 2026-09-29** — checked directly
+  (grepped for `UsbManager`/`UsbSerialPort`/OTG across every `.kt`/`.java`/`.md` file, zero real
+  hits at the time). Real, first step now shipped in PARENA: see Phase A2 below — a new PARENA
+  compiler capability (`:java` FFI) plus a first real module (`hw/usb_serial.prn`). Still
+  genuinely missing: the actual Android app, and the real `UsbManager` device-permission dance
+  itself (stays hand-written Kotlin — this v0 Java emitter cannot express stateful callback-driven
+  platform ceremony at all, only stateless scalar calls against a static field).
 - **PARENA's Java emitter is real but v0/scalar-only** (no structs/loops/collections — confirmed
   directly in `DEADWEIGHT/NORTHSTAR.md`'s own capability audit, and `SPIDERBEETLE`'s real,
   shipped `battery_ui.prn`→`BatteryUi.java` is still its only precedent: two standalone scalar
@@ -370,9 +372,20 @@ platform, separate concern):**
   structure (Hilt DI, Retrofit → IDUNA for auth), no payment or serial code yet. Real, honest:
   scoped and written here, not buildable/runnable in this sandbox (no Android SDK) — same gap
   SPIDERBEETLE already named.
-- **Phase A2 — USB-OTG serial to the Feather.** Genuinely new work (no precedent anywhere in this
-  monorepo): evaluate `usb-serial-for-android` vs. a hand-rolled `UsbManager` driver, wire it to
-  the same routing decisions `traffic_router.prn` already provides on the Windows side.
+- **Phase A2 — USB-OTG serial to the Feather. Partially done.** Founder real-time: "usb to serial
+  code goes in parena" — resolved: PARENA's Java emitter had **no FFI mechanism of any kind**
+  before today (checked directly, only a hardcoded `java.lang.Math` table), so a new
+  `#target {:java (inline-java "...")}` escape hatch was added to `src/emit_java.c`, mirroring
+  the C emitter's own long-standing `:c` hatch exactly (8 new tests, 43/43 total pass). First real
+  consumer: `PARENA/stdlib/hw/usb_serial.prn` (`usb-serial-is-connected`/`-write-byte`/
+  `-read-byte`/`-baud-for-board`), verified via the real `parena build` CLI + a real `javac`
+  compiling the emitted Java against a hand-written stub standing in for the real
+  `usb-serial-for-android` library (no Android SDK in this sandbox — same gap SPIDERBEETLE/
+  MJOLNIR already name), 8/8 runtime assertions pass. Real, honest, still not done: the actual
+  Android app calling this (Phase A1 doesn't exist yet), the real permission/open ceremony
+  (genuinely inexpressible in this scalar-only v0 — stays hand-written Kotlin by design, same
+  split as Windows `hardware/win_serial.c`), and verification against the real library/SDK. See
+  `PARENA/STDLIB.md`'s own "Java emitter's new `:java` FFI escape hatch" section for full detail.
 - **Phase A3 — Payment processing.** Explicitly gated, not started: real money changes hands here,
   a materially different risk class from the rest of this doc. Needs its own founder go-ahead and
   processor choice (Stripe Terminal / Square / native Android NFC Tap-to-Pay were named in the
