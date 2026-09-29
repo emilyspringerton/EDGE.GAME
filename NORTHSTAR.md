@@ -258,10 +258,16 @@ code changes (above); the relay handles making the embedded toolchain DO somethi
   profile work + the Upload-button current-file/board-profile fix in PARENA's own editor (see
   above) — both real, tested, and land as direct, immediate improvements to PARENA/EDITOR.GAME
   regardless of EDGE.GAME's own timeline.
-- **Phase 1 — the wire protocol + a minimal, fully verifiable slice with no real hardware.**
-  `server/relay.js` (plain TCP + NDJSON, mint/hold one client connection, an HTTP API for the
-  operator) + `client/edge_client.c` (connects, authenticates, acks commands) — proves the whole
-  pipeline end to end with a real local test before any physical board is involved. Not started.
+- **Phase 1 — done.** `server/relay.js` (plain TCP + NDJSON, holds one cabinet connection, an
+  authenticated HTTP API for the operator) + `client/edge_client.c` (connects, authenticates, and
+  answers a real `route` command by calling into the actual compiled `route_for_source()` from
+  Phase 0's `traffic_router.prn` — not just an echo, proving the two phases genuinely fit
+  together). `make test-e2e`: a real, reproducible, no-hardware local proof — 6/6 checks pass
+  (cabinet-connected status, all three real routing decisions, a generic ack for an unrelated
+  command type, and operator-token rejection), `-Wall -Wextra -pedantic -Werror` clean. One real
+  gotcha found and fixed: the shared PARENA runtime needs to be the very first `#include` in any
+  file that pulls it in (it defines `_POSIX_C_SOURCE` internally, which only works if set before
+  glibc's own headers are first touched) — `edge_client.c`'s original include order broke this.
 - **Phase 2 — embed the IDE widget + bundle the toolchain.** Pull EDITOR.GAME's real widget-
   lifecycle API + PARENA's now-fixed `editor_main.c` compile/upload logic into EDGE.GAME's own
   Windows client; acquire and package a verified Windows-native `parena.exe` +
