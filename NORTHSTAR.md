@@ -38,6 +38,19 @@
    "it needs git affordances like the source code will be on the windows computer but the compiler
    is actually built into the game"; (c) "think of it like vs code but its a game." See "EDGE.GAME
    as an IDE" below for the full, consolidated design this resolves into.
+6. After Phase 1 shipped, pasted a second AI-generated tutorial (same reviewed-critically-not-
+   transcribed treatment as message 3's own pasted design) about Android-tablet kiosk payment
+   processing (Stripe/Square/PayPal, Tap-to-Pay/QR, USB-MIDI-triggered relays on a successful
+   charge, a charity-donation-cabinet framing). Asked directly whether this was part of EDGE.GAME
+   or a separate project — founder's answer, verbatim: "its a separate component of EDGE.GAME we
+   have an android tablet that is actually talks to the whole system too - so its like kubernetes
+   with like 2 raspi bs an edge node raspi w or 2 a ada feather roting all of the hardware and
+   maybe an arduino or 2 as a slave for more peripherals - like the android is going to handle the
+   main brain of the actual kiosk - the windows environment is our dev platform the android
+   platform is our execution platform the feather will be the interface to either either usb to
+   the windows computer or usb OTG adapter to the android tablet." This is real, resolved, and adds
+   a materially new component — see "Production topology: Android as the execution platform"
+   below for the full, consolidated design this resolves into.
 
 ## Access model (resolved, not the default assumption)
 
@@ -96,6 +109,42 @@ Windows PC  <----------->  Adafruit Feather  <---------------------------->  Ras
   confirmed via `avr-objdump` disassembly) at the wrong speed — fixed with a dedicated
   `examples/avr/blink_main_feather.c`.
 
+## Production topology: Android as the execution platform (2026-09-29 clarification)
+
+Message 6 above resolves a real, two-platform split that didn't exist in the original scoping —
+not a bigger version of the same Windows-only plan, a second, parallel arm:
+
+- **Windows = dev/debug platform.** Unchanged from everything above — this is where I (Claude, via
+  the server relay) help debug the USB upload code, the serial protocol, etc. Phases 0-7 below are
+  entirely this arm.
+- **Android tablet = the kiosk's actual production "brain."** The tablet, not the Windows PC, is
+  what runs live in the field — it's the real HMI (screen, payment UI, game trigger) and the real
+  decision-maker once the cabinet is deployed. The Windows arm exists to develop and debug the
+  hardware/firmware side; it does not run in production.
+- **The Feather is dual-mode, not simultaneous.** One physical USB link, switched between two
+  hosts depending on which platform is currently driving the cabinet: USB directly to the Windows
+  PC during dev, or through a USB-OTG adapter to the Android tablet in production. Whichever host
+  is attached owns the serial link; there's no scoped case (yet) for both being attached and
+  arbitrating at once.
+- **The Raspberry Pis are a real edge-node layer, not a single companion box.** Founder's own
+  words: "like kubernetes with like 2 raspi bs an edge node." Real, honest, NOT yet resolved:
+  whether this means literal container orchestration (k3s/k8s across 2 Pis) or an informal way of
+  saying "2 Pi nodes splitting hardware-routing duties" — see open question 5 below; nothing here
+  assumes either answer.
+- **1-2 additional Arduino boards as peripheral slaves**, beyond the Nano already scoped in
+  "Real physical topology" above — same multi-profile avrdude problem already solved there
+  applies again; no new toolchain work, just more boards to flash with the same pipeline.
+- **Payment processing lives on the Android tablet**, gating a paid game/kiosk session before the
+  Feather is told to do anything (Stripe/Square/PayPal/Tap-to-Pay/QR per the founder's own pasted
+  material, none chosen yet). Named here but deliberately **not scoped into a phase with code
+  yet** — this is real financial infrastructure (actual charges, not a toy), a materially
+  different risk class from everything else in this doc, and gets its own explicit go-ahead and
+  processor choice before any implementation, not folded silently into the general Android phase.
+
+This does not change or invalidate anything in "Access model," "Real physical topology," "The
+traffic_router module," or "EDGE.GAME as an IDE" above — those all still describe the real
+Windows/dev arm exactly as scoped. This section is additive: a second, parallel production arm.
+
 ## Real, existing capability audit — checked directly, not assumed
 
 - **The Nano is directly covered today.** `PARENA/docs/AVR_ARDUINO_NORTHSTAR.md` + the real,
@@ -122,6 +171,28 @@ Windows PC  <----------->  Adafruit Feather  <---------------------------->  Ras
 - **DEADWEIGHT_2's `.github/workflows/ci.yml` windows job** is a real, proven mingw + SDL2-mingw
   cross-compile recipe (already produces a working `dw2_client.exe` + `SDL2.dll` + `PLAY.bat` flat
   zip) — directly reusable as EDGE.GAME's own Windows build pipeline.
+- **MJOLNIR is the real Android precedent in this monorepo** (Kotlin 2.0/Jetpack Compose/Hilt,
+  Retrofit → IDUNA, FCM push) — the real template for an EDGE.GAME Android client's project
+  skeleton and IDUNA auth wiring, not invented from scratch. Real, honest, checked directly: this
+  sandbox has **no Android SDK and no `gradlew` wrapper checked out even for MJOLNIR itself** —
+  the same exact gap `SPIDERBEETLE/NORTHSTAR.md` already found and named. An Android client here
+  can be scoped and its source written, but not built or run in this sandbox — needs the founder's
+  own machine or a real CI Android-SDK runner, same as every other Android work in this monorepo.
+- **No USB-OTG-serial code exists anywhere in this monorepo today** — checked directly (grepped
+  for `UsbManager`/`UsbSerialPort`/OTG across every `.kt`/`.java`/`.md` file, zero real hits). This
+  is genuinely new work on the Android side: Android's `UsbManager` device-permission dance plus
+  either a hand-rolled bulk-transfer driver or the common third-party `usb-serial-for-android`
+  library (real and widely used, not yet evaluated or vetted for this project).
+- **PARENA's Java emitter is real but v0/scalar-only** (no structs/loops/collections — confirmed
+  directly in `DEADWEIGHT/NORTHSTAR.md`'s own capability audit, and `SPIDERBEETLE`'s real,
+  shipped `battery_ui.prn`→`BatteryUi.java` is still its only precedent: two standalone scalar
+  helper functions, not a whole app). The same boundary applies here — PARENA can supply small,
+  scalar decision helpers into the Android client (same shape as SPIDERBEETLE's), not the client
+  itself.
+- **IDUNA's own inventory scoping doc independently confirms real hardware on hand**
+  (`IDUNA/docs/NORTHSTAR_INVENTORY.md`, `II-001`, 2026-09-03, founder's own words): "2 rasbberyy
+  pi b2 and 2 zero i think? also i have at least 1 ada feather with some kinda packetmodule" — a
+  real, pre-existing record matching "2 raspi's" named here, not a new or hypothetical claim.
 
 ## The traffic_router module (real, built, tested — Phase 0, done)
 
@@ -292,6 +363,24 @@ code changes (above); the relay handles making the embedded toolchain DO somethi
   carry the bundled toolchain too), so "ship a new binary, founder downloads and runs it" is a real
   one-command release, not a manual build.
 
+**Production/Android arm (parallel to Phases 0-7 above, not sequenced after them — separate
+platform, separate concern):**
+
+- **Phase A1 — Android client skeleton.** A new Kotlin/Compose project templated on MJOLNIR's own
+  structure (Hilt DI, Retrofit → IDUNA for auth), no payment or serial code yet. Real, honest:
+  scoped and written here, not buildable/runnable in this sandbox (no Android SDK) — same gap
+  SPIDERBEETLE already named.
+- **Phase A2 — USB-OTG serial to the Feather.** Genuinely new work (no precedent anywhere in this
+  monorepo): evaluate `usb-serial-for-android` vs. a hand-rolled `UsbManager` driver, wire it to
+  the same routing decisions `traffic_router.prn` already provides on the Windows side.
+- **Phase A3 — Payment processing.** Explicitly gated, not started: real money changes hands here,
+  a materially different risk class from the rest of this doc. Needs its own founder go-ahead and
+  processor choice (Stripe Terminal / Square / native Android NFC Tap-to-Pay were named in the
+  founder's own pasted material, none chosen) before any code is written.
+- **Phase A4 — Pi edge-node layer.** Blocked on open question 5 below (literal k3s/k8s vs. an
+  informal "2 Pi nodes splitting duties") — real infrastructure scope differs a lot between the two
+  answers, not guessed at here.
+
 ## Open questions for the founder
 
 1. **Is "a regular arduino" an Uno?** Assumed so (no new toolchain work either way vs. a
@@ -306,3 +395,11 @@ code changes (above); the relay handles making the embedded toolchain DO somethi
    working copy pushing to/pulling from a repo Claude can already reach (e.g. a real GitHub repo
    once EDGE.GAME has an upstream), or something more local/direct (the relay server itself hosting
    a bare repo)? Affects Phase 4's real design, not guessed at here.
+5. **Is the "kubernetes" framing for the 2 Raspberry Pis literal or informal?** Real container
+   orchestration (k3s/k8s) across 2 Pis is a materially bigger infrastructure lift than 2 Pi nodes
+   each just running a plain PARENA/Linux companion program that splits hardware-routing duties.
+   Affects Phase A4 directly — not guessed at here.
+6. **Payment processor/SDK choice, and is this real production payment handling from day one?**
+   The founder's own pasted material names Stripe Terminal, Square, and native Android NFC
+   Tap-to-Pay as options, none chosen. Given real money is involved, this needs an explicit
+   go-ahead and choice before Phase A3 gets any code — not assumed or defaulted to one option.
