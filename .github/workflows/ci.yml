@@ -142,7 +142,7 @@ jobs:
       - name: Cross-compile edge_client.exe
         run: make client-windows
 
-      - name: Bundle Windows client (flat zip: exe + PLAY.bat, no SDL2.dll -- nothing links it yet)
+      - name: "Bundle Windows client (flat zip of exe, edge_ctl.exe and PLAY.bat; no SDL2.dll, nothing links it yet)"
         run: |
           set -euo pipefail
           rm -rf pkg/win && mkdir -p pkg/win
