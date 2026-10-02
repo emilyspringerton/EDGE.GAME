@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2026-10-02
+- encrypted transport on every socket: ML-KEM-768 + LZ4 + XChaCha20-Poly1305 (PARENA secure_channel), edge_ctl CLI, pinned/TOFU fingerprint, handshake reaper, Windows build (#491) (sess-20260923-1030-4a526255)
 
 - client: USB/COM probe (edge_client probe / usb_probe command) finds the Feather 32u4 by VID/PID on Windows; make test-usb-probe (#493) (sess-20260923-1030-4a526255)
 
