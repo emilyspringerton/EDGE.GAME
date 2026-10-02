@@ -47,6 +47,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../common/sec_transport.h"
 #include "reflux_runtime.h" /* REFLUX_ACTION_* constants only -- reflux_host_* themselves are
                                 called from the LLVM-compiled reflux_gen.o, never directly here. */
 
@@ -95,12 +96,14 @@ static int extract_int(const char *json, const char *field, int *out) {
     return 1;
 }
 
-#define LINEBUF_SIZE 8192
+#define LINEBUF_SIZE 65536 /* one full secure frame (SEC_MAX_PLAIN) plus a partial line */
 #define MAX_OPERATORS 16
 #define MAX_PENDING 32
 
 typedef struct {
     int fd;
+    SecConn sec;
+    time_t accepted;
     int in_use;
     int authed;
     int is_subscriber;
@@ -120,6 +123,8 @@ static OperatorConn g_operators[MAX_OPERATORS];
 static Pending g_pending[MAX_PENDING];
 
 static int g_cabinet_fd = -1;
+static SecConn g_cabinet_sec;
+static time_t g_cabinet_accepted;
 static int g_cabinet_authed = 0;
 static char g_cabinet_buf[LINEBUF_SIZE];
 static size_t g_cabinet_buflen = 0;
@@ -129,12 +134,22 @@ static const char *g_operator_token;
 static const char *g_pi_token;
 static int g_command_timeout_s;
 
+/* Every socket is a SecConn (ML-KEM handshake + LZ4 + XChaCha20-Poly1305, see sec_transport.h):
+   send_line finds the connection for an fd and encrypts. A peer that hasn't finished the handshake
+   gets nothing. */
+static SecConn *conn_for_fd(int fd) {
+    if (fd >= 0 && fd == g_cabinet_fd) return &g_cabinet_sec;
+    for (int i = 0; i < MAX_OPERATORS; i++)
+        if (g_operators[i].in_use && g_operators[i].fd == fd) return &g_operators[i].sec;
+    return NULL;
+}
+
 static void send_line(int fd, const char *json) {
-    char buf[LINEBUF_SIZE];
+    static char buf[LINEBUF_SIZE];
+    SecConn *c = conn_for_fd(fd);
     int n = snprintf(buf, sizeof(buf), "%s\n", json);
-    if (n < 0 || (size_t)n >= sizeof(buf)) return;
-    ssize_t unused = write(fd, buf, (size_t)n);
-    (void)unused;
+    if (!c || !c->established || n < 0 || (size_t)n >= sizeof(buf)) return;
+    if (sec_send(c, buf, (size_t)n) < 0) { /* peer gone: the select loop sees EOF on its next read */ }
 }
 
 /* push_new_events_to_subscribers -- REFLUX's own real model is poll-your-own-cursor (see
@@ -203,6 +218,25 @@ static void handle_events_since(OperatorConn *op, const char *line) {
     }
     if (off + 2 < sizeof(out)) { out[off++] = ']'; out[off++] = '}'; out[off] = '\0'; }
     send_line(op->fd, out);
+}
+
+/* Slow-loris guard: a connection that hasn't finished the secure handshake AND sent a valid hello
+   within g_handshake_deadline_s seconds is closed, so half-open sockets can't exhaust the 16 operator slots. */
+static int g_handshake_deadline_s = 10; /* EDGE_HANDSHAKE_DEADLINE_S overrides (tests use 2) */
+static void reap_unauthenticated(void) {
+    time_t now = time(NULL);
+    if (g_cabinet_fd >= 0 && !g_cabinet_authed && now - g_cabinet_accepted > g_handshake_deadline_s) {
+        fprintf(stderr, "[relay] dropping cabinet connection that never authenticated\n");
+        close(g_cabinet_fd);
+        g_cabinet_fd = -1;
+    }
+    for (int i = 0; i < MAX_OPERATORS; i++) {
+        OperatorConn *op = &g_operators[i];
+        if (op->in_use && !op->authed && now - op->accepted > g_handshake_deadline_s) {
+            close(op->fd);
+            op->in_use = 0;
+        }
+    }
 }
 
 static void find_and_expire_pending(void) {
@@ -293,28 +327,48 @@ static void handle_cabinet_line(const char *line) {
     }
 }
 
-/* feed_lines -- accumulates into `buf`/`buflen`, invoking `handler` once per complete NDJSON line
-   read from `fd`. Returns 0 if the peer closed (caller should tear the connection down), 1 otherwise. */
-static int feed_lines(int fd, char *buf, size_t *buflen, void (*handler)(const char *line)) {
-    char chunk[4096];
-    ssize_t n = read(fd, chunk, sizeof(chunk));
-    if (n <= 0) return 0;
-    if (*buflen + (size_t)n >= LINEBUF_SIZE) { *buflen = 0; return 1; } /* real, honest overflow-drop, not a buffer overrun */
-    memcpy(buf + *buflen, chunk, (size_t)n);
-    *buflen += (size_t)n;
-    buf[*buflen] = '\0';
+static void device_or_operator_dispatch(int slot, const char *line);
 
+/* ingest -- append decrypted bytes to a connection's line buffer and dispatch each complete NDJSON
+   line. slot < 0 = the cabinet. Returns 0 if a handler closed the connection, 1 otherwise. */
+static int ingest(char *buf, size_t *buflen, const unsigned char *chunk, size_t n, int slot) {
+    if (*buflen + n >= LINEBUF_SIZE) { *buflen = 0; return 1; } /* real, honest overflow-drop, not a buffer overrun */
+    memcpy(buf + *buflen, chunk, n);
+    *buflen += n;
+    buf[*buflen] = '\0';
     char *start = buf;
     char *nl;
     while ((nl = strchr(start, '\n')) != NULL) {
         *nl = '\0';
-        if (strlen(start) > 0) handler(start);
+        if (strlen(start) > 0) {
+            if (slot < 0) handle_cabinet_line(start); else device_or_operator_dispatch(slot, start);
+        }
+        if (slot < 0 ? g_cabinet_fd < 0 : !g_operators[slot].in_use) return 0;
         start = nl + 1;
     }
     size_t remaining = strlen(start);
     memmove(buf, start, remaining + 1);
     *buflen = remaining;
     return 1;
+}
+
+/* pump -- one readable event on a SecConn: pull bytes, decrypt every complete frame, ingest each.
+   Returns 0 when the connection must be torn down (EOF, auth failure, or a handler closed it). */
+static int pump(SecConn *sc, char *buf, size_t *buflen, int slot) {
+    static unsigned char plain[SEC_MAX_PLAIN];
+    if (sec_fill(sc) <= 0) return 0;
+    for (;;) {
+        size_t before = sc->rawlen;
+        long n = sec_next(sc, plain, sizeof(plain));
+        if (n < 0) return 0;
+        if (n == 0) {
+            /* 0 = need more bytes, OR the handshake step just consumed the client's ct (frames
+               already buffered behind it still need draining) -- rawlen shrinks only in that case. */
+            if (sc->rawlen < before) continue;
+            return 1;
+        }
+        if (!ingest(buf, buflen, plain, (size_t)n, slot)) return 0;
+    }
 }
 
 static void device_or_operator_dispatch(int slot, const char *line) {
@@ -351,12 +405,24 @@ int main(void) {
     g_client_token = getenv("EDGE_CLIENT_TOKEN");
     g_operator_token = getenv("EDGE_OPERATOR_TOKEN");
     g_pi_token = getenv("EDGE_PI_TOKEN");
+    if (getenv("EDGE_HANDSHAKE_DEADLINE_S")) g_handshake_deadline_s = atoi(getenv("EDGE_HANDSHAKE_DEADLINE_S"));
     const char *timeout_s = getenv("EDGE_COMMAND_TIMEOUT_MS");
     g_command_timeout_s = timeout_s ? (atoi(timeout_s) + 999) / 1000 : 5;
     if (!g_client_token || !*g_client_token || !g_operator_token || !*g_operator_token) {
         fprintf(stderr, "EDGE_CLIENT_TOKEN and EDGE_OPERATOR_TOKEN must both be set\n");
         return 1;
     }
+
+    const char *key_path = getenv("EDGE_KEY_FILE");
+    unsigned char pin[SEC_PIN_BYTES];
+    char pin_hex[2 * SEC_PIN_BYTES + 1];
+    if (sec_server_load_or_create_key(key_path && *key_path ? key_path : "edge_relay.key", pin) < 0) {
+        fprintf(stderr, "relay: cannot load/create the ML-KEM server key\n");
+        return 1;
+    }
+    sec_hex(pin, sizeof(pin), pin_hex);
+    fprintf(stderr, "[relay] ML-KEM-768 + LZ4 + XChaCha20-Poly1305 only (no plaintext mode)\n");
+    fprintf(stderr, "[relay] server fingerprint (clients pin this): %s\n", pin_hex);
 
     int cabinet_listen_fd = tcp_listen_raw(client_port);
     int operator_listen_fd = tcp_listen_raw(operator_port);
@@ -388,6 +454,7 @@ int main(void) {
         if (r < 0) continue;
 
         find_and_expire_pending();
+        reap_unauthenticated();
 
         if (r == 0) continue;
 
@@ -395,9 +462,13 @@ int main(void) {
             int fd = tcp_accept_raw(cabinet_listen_fd);
             if (fd >= 0) {
                 if (g_cabinet_fd >= 0) tcp_close_raw(g_cabinet_fd);
-                g_cabinet_fd = fd;
-                g_cabinet_authed = 0;
-                g_cabinet_buflen = 0;
+                if (sec_server_begin(&g_cabinet_sec, fd) < 0) { tcp_close_raw(fd); }
+                else {
+                    g_cabinet_fd = fd;
+                    g_cabinet_accepted = time(NULL);
+                    g_cabinet_authed = 0;
+                    g_cabinet_buflen = 0;
+                }
             }
         }
         if (FD_ISSET(operator_listen_fd, &rfds)) {
@@ -409,13 +480,18 @@ int main(void) {
                     tcp_close_raw(fd);
                 } else {
                     memset(&g_operators[slot], 0, sizeof(OperatorConn));
-                    g_operators[slot].fd = fd;
-                    g_operators[slot].in_use = 1;
+                    if (sec_server_begin(&g_operators[slot].sec, fd) < 0) {
+                        tcp_close_raw(fd);
+                    } else {
+                        g_operators[slot].fd = fd;
+                        g_operators[slot].accepted = time(NULL);
+                        g_operators[slot].in_use = 1;
+                    }
                 }
             }
         }
         if (g_cabinet_fd >= 0 && FD_ISSET(g_cabinet_fd, &rfds)) {
-            if (!feed_lines(g_cabinet_fd, g_cabinet_buf, &g_cabinet_buflen, handle_cabinet_line)) {
+            if (!pump(&g_cabinet_sec, g_cabinet_buf, &g_cabinet_buflen, -1)) {
                 fprintf(stderr, "[relay] cabinet disconnected\n");
                 close(g_cabinet_fd);
                 g_cabinet_fd = -1;
@@ -425,30 +501,9 @@ int main(void) {
         for (int i = 0; i < MAX_OPERATORS; i++) {
             OperatorConn *op = &g_operators[i];
             if (!op->in_use || !FD_ISSET(op->fd, &rfds)) continue;
-            int slot_capture = i;
-            char chunk[4096];
-            ssize_t n = read(op->fd, chunk, sizeof(chunk));
-            if (n <= 0) {
+            if (!pump(&op->sec, op->buf, &op->buflen, i) && op->in_use) {
                 close(op->fd);
                 op->in_use = 0;
-                continue;
-            }
-            if (op->buflen + (size_t)n >= LINEBUF_SIZE) { op->buflen = 0; continue; }
-            memcpy(op->buf + op->buflen, chunk, (size_t)n);
-            op->buflen += (size_t)n;
-            op->buf[op->buflen] = '\0';
-            char *start = op->buf;
-            char *nl;
-            while ((nl = strchr(start, '\n')) != NULL) {
-                *nl = '\0';
-                if (strlen(start) > 0) device_or_operator_dispatch(slot_capture, start);
-                if (!op->in_use) break; /* dispatch may have closed this connection (bad hello) */
-                start = nl + 1;
-            }
-            if (op->in_use) {
-                size_t remaining = strlen(start);
-                memmove(op->buf, start, remaining + 1);
-                op->buflen = remaining;
             }
         }
     }

@@ -30,14 +30,46 @@ LLVM_LIB_PATH := $(LLVM_TOOLCHAIN_ROOT)/usr/lib/x86_64-linux-gnu:$(LLVM_TOOLCHAI
 
 CC_WIN ?= x86_64-w64-mingw32-gcc
 
-.PHONY: test-usb-probe client client-windows relay run-relay test-e2e clean
+# ---- secure transport (card #491) -------------------------------------------------------------
+# common/sec_transport.c wraps PARENA's net/secure_channel (ML-KEM-768 + LZ4 + XChaCha20-Poly1305).
+# vendor/sc/sc_gen.c is the vendored, generated PARENA output, vendor/mlkem + vendor/aead the
+# unmodified reference C it FFI-binds (see each dir's README.vendored). Regenerate sc_gen.c with
+# `make regen-sc` (needs a built ../PARENA). The vendored C gets looser flags than our own code:
+# it is third-party reference code, not ours to -Werror.
+SEC_INC = -I client/runtime -I vendor -I vendor/mlkem
+SEC_DEFS = -DPARENA_WITH_MLKEM -DPARENA_WITH_AEAD
+SEC_SRCS = common/sec_transport.c client/runtime/parena_runtime.c
+
+regen-sc:
+	cd $(PARENA_ROOT) && ./parena build stdlib/string.prn stdlib/bytes.prn stdlib/crypto/aead.prn \
+		stdlib/compress/lz4_block.prn stdlib/crypto/mlkem.prn stdlib/net/secure_channel.prn \
+		-o ../EDGE.GAME/vendor/sc/sc_gen.c
+	cp $(PARENA_ROOT)/runtime/parena_runtime.h client/runtime/parena_runtime.h
+
+# build/libvendor.a -- vendored mlkem + monocypher, native; build/libvendor_win.a -- same for mingw.
+build/libvendor.a: $(wildcard vendor/mlkem/*.c) vendor/aead/monocypher.c | build
+	mkdir -p build/vobj && cd build/vobj && rm -f *.o && \
+		$(CC) -std=c99 -O2 -D_GNU_SOURCE -w -I ../../vendor/mlkem -c $(addprefix ../../,$(wildcard vendor/mlkem/*.c)) ../../vendor/aead/monocypher.c
+	ar rcs $@ build/vobj/*.o
+
+build/libvendor_win.a: $(wildcard vendor/mlkem/*.c) vendor/aead/monocypher.c | build
+	mkdir -p build/vobjw && cd build/vobjw && rm -f *.o && \
+		$(CC_WIN) -std=c99 -O2 -w -I ../../vendor/mlkem -c $(addprefix ../../,$(wildcard vendor/mlkem/*.c)) ../../vendor/aead/monocypher.c
+	x86_64-w64-mingw32-ar rcs $@ build/vobjw/*.o
+
+.PHONY: regen-sc test-usb-probe client edge-ctl client-windows relay run-relay test-e2e clean
 
 build:
 	mkdir -p build
 
-client: build
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -I client/runtime \
-		client/edge_client.c client/usb_probe.c client/runtime/parena_runtime.c -o build/edge_client -lm
+client: build build/libvendor.a
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) \
+		client/edge_client.c client/usb_probe.c $(SEC_SRCS) build/libvendor.a -o build/edge_client -lm
+
+# edge-ctl -- the operator/device command-line tool (also what the Pi's boot announce and test-e2e use).
+edge-ctl: build build/libvendor.a
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) \
+		client/edge_ctl.c $(SEC_SRCS) build/libvendor.a -o build/edge_ctl -lm
 
 # client-windows -- real mingw cross-compile of the same edge_client.c (CI auto-release, S584
 # cont. 3, founder real-time: "get CICD auto releases set up for the game client"). edge_client.c
@@ -50,9 +82,13 @@ client: build
 # Native `client` above stays unconditional/unguarded, matching every other consumer of this
 # shared runtime header in this monorepo (PARENA/docs: "unconditionally available, harmless if
 # unused") -- this is a narrow, CI-only carve-out, not a repo-wide convention change.
-client-windows: build
-	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS -I client/runtime \
-		client/edge_client.c client/usb_probe.c client/runtime/parena_runtime.c -o build/edge_client.exe -lws2_32 -ladvapi32 -lm
+client-windows: build build/libvendor_win.a
+	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
+		client/edge_client.c client/usb_probe.c $(SEC_SRCS) build/libvendor_win.a \
+		-o build/edge_client.exe -lws2_32 -ladvapi32 -lm
+	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
+		client/edge_ctl.c $(SEC_SRCS) build/libvendor_win.a \
+		-o build/edge_ctl.exe -lws2_32 -ladvapi32 -lm
 
 # test-usb-probe -- classification, JSON, and POSIX enumeration against a fake sysfs tree.
 test-usb-probe: build
@@ -66,7 +102,7 @@ test-usb-probe: build
 # one binary. Needs a sibling ../PARENA checkout with `parena` already built (`make build` there)
 # and the real, no-sudo-acquired LLVM toolchain PARENA/docs/LLVM_BACKEND_NORTHSTAR.md documents
 # acquiring (`apt-get download llvm-18 clang-18 ...` + `dpkg -x`).
-relay: build
+relay: build build/libvendor.a
 	cd $(PARENA_ROOT) && ./parena build stdlib/reflux/reflux.prn -o ../EDGE.GAME/server/reflux_gen.ll
 	cd $(PARENA_ROOT) && ./parena build stdlib/net/tcp_llvm.prn -o ../EDGE.GAME/server/tcp_llvm_gen.ll
 	LD_LIBRARY_PATH=$(LLVM_LIB_PATH) $(LLC) -mtriple=x86_64-pc-linux-gnu -filetype=obj \
@@ -75,9 +111,12 @@ relay: build
 		server/tcp_llvm_gen.ll -o server/tcp_llvm_gen.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -c server/reflux_runtime.c -o server/reflux_runtime.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -c server/tcp_llvm_glue.c -o server/tcp_llvm_glue.o
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -c server/relay_main.c -o server/relay_main.o
-	$(CC) -o build/edge_relay server/relay_main.o server/reflux_runtime.o server/tcp_llvm_glue.o \
-		server/reflux_gen.o server/tcp_llvm_gen.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) -c server/relay_main.c -o server/relay_main.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -c common/sec_transport.c -o server/sec_transport.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -c client/runtime/parena_runtime.c -o server/parena_runtime.o
+	$(CC) -o build/edge_relay server/relay_main.o server/sec_transport.o server/parena_runtime.o \
+		server/reflux_runtime.o server/tcp_llvm_glue.o server/reflux_gen.o server/tcp_llvm_gen.o \
+		build/libvendor.a -lm
 
 run-relay: relay
 	./build/edge_relay
@@ -86,7 +125,7 @@ run-relay: relay
 # sends real route commands through the actual TCP+NDJSON -> compiled-PARENA-decision path, checks
 # the replies, exercises the REFLUX events channel (buffered + live), then shuts both down. See
 # NORTHSTAR.md's own phased plan for what this proves and doesn't.
-test-e2e: client relay
+test-e2e: client relay edge-ctl
 	EDGE_CLIENT_TOKEN=e2e-client-secret EDGE_OPERATOR_TOKEN=e2e-operator-secret \
 	EDGE_CLIENT_PORT=18091 EDGE_OPERATOR_PORT=18092 \
 	bash scripts/test_e2e.sh

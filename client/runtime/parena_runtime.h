@@ -43,6 +43,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <math.h>   /* F32 elementwise primitives (tensor/nn.prn) */
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -533,6 +534,275 @@ static inline Bytes bytes_slice_impl(Bytes b, int start, int end, Arena *dest) {
     return out;
 }
 
+/* ---- F32 buffers (stdlib/tensor/f32.prn, stdlib/tensor/conv.prn) -----------------------------------
+ *
+ * Founder real-time, 2026-10-01: "dive into the TTS stuff with parena some kind of edge tts model" +
+ * the standing rule "always implement core deps in PARENA first". A neural-inference engine (the
+ * Piper/VITS port, docs/TTS_VITS_PORT_PLAN.md) needs packed float32 tensors and a few hot bulk
+ * kernels; PARENA's scalar type is F64 and its Vec is per-element boxed, so the substrate is a plain
+ * `Bytes` buffer read/written as float32 (4 bytes/element, host byte order -- see f32_load_le_impl
+ * for the portable file reader) plus a handful of FUSED primitives for the inner loops. The outer
+ * loops (channels, taps, time) stay ordinary PARENA loop/recur. Measured (tests/bench_tensor_conv.c,
+ * conv1d 64x64 k=7 L=4096, `make bench-tensor`): with the innermost axpy as one primitive the PARENA-driven
+ * kernel ran at parity with hand-written C on an idle machine (~2.9 GMAC/s, an earlier prototype run) and at
+ * ~2.2 vs ~4.7 GMAC/s (about half) on a heavily loaded one -- so treat "within 2x of hand-written C" as the
+ * honest claim and re-measure on an idle box before quoting a number.
+ *
+ * Contract (same honest discipline as bytes_get_impl/bytes_set_impl): every index/range is validated
+ * ONCE up front; anything outside the buffers makes the call a silent no-op (reads return 0), it
+ * never reads or writes out of bounds and never aborts. Element offsets are in FLOATS, not bytes.
+ * Determinism: no fast-math, fixed accumulation order (the dot product uses 8 fixed partial sums);
+ * build with -ffp-contract=off for bit-reproducibility across machines/compilers (an FMA changes
+ * rounding). Misaligned buffers fall back to a memcpy path, so a Bytes slice is always safe. */
+static inline int f32_len_impl(Bytes b) { return b.len / 4; }
+
+static inline Bytes f32_alloc_impl(Arena *dest, int n) {
+    if (n <= 0 || n > 0x1FFFFFFF) return bytes_alloc_impl(dest, 0);
+    Bytes b = bytes_alloc_impl(dest, n * 4);
+    memset(b.data, 0, (size_t)b.len);
+    return b;
+}
+
+static inline double f32_get_impl(Bytes b, int i) {
+    if (i < 0 || i >= b.len / 4) return 0.0;
+    float v;
+    memcpy(&v, b.data + (size_t)i * 4u, 4);
+    return (double)v;
+}
+
+static inline void f32_set_impl(Bytes b, int i, double v) {
+    if (i < 0 || i >= b.len / 4) return;
+    float f = (float)v;
+    memcpy(b.data + (size_t)i * 4u, &f, 4);
+}
+
+static inline int f32_range_ok_(Bytes b, int off, int n) {
+    return n > 0 && off >= 0 && off <= b.len / 4 && n <= b.len / 4 - off;
+}
+
+static inline int f32_aligned_(Bytes b) { return (((size_t)b.data) & 3u) == 0; }
+
+static inline void f32_fill_impl(Bytes b, int off, int n, double v) {
+    if (!f32_range_ok_(b, off, n)) return;
+    float f = (float)v;
+    for (int i = 0; i < n; i++) memcpy(b.data + ((size_t)off + (size_t)i) * 4u, &f, 4);
+}
+
+static inline void f32_copy_impl(Bytes dst, int doff, Bytes src, int soff, int n) {
+    if (!f32_range_ok_(dst, doff, n) || !f32_range_ok_(src, soff, n)) return;
+    memmove(dst.data + (size_t)doff * 4u, src.data + (size_t)soff * 4u, (size_t)n * 4u);
+}
+
+/* y[yo+i] += a * x[xo+i]  -- the conv/matmul inner loop. y and x may be the same buffer only if the
+ * ranges do not overlap. */
+/* The -O2 "very-cheap" vectorizer cost model refuses loops whose trip count is unknown (it would need an
+ * epilogue); this one is THE hot loop of every conv/matmul, so ask for the full vectorizer on it. */
+#if defined(__GNUC__) && !defined(__clang__)
+#define PARENA_F32_HOT __attribute__((optimize("O3")))
+#else
+#define PARENA_F32_HOT
+#endif
+PARENA_F32_HOT
+static inline void f32_axpy_impl(Bytes y, int yo, Bytes x, int xo, double a, int n) {
+    if (!f32_range_ok_(y, yo, n) || !f32_range_ok_(x, xo, n)) return;
+    const float av = (float)a;
+    if (f32_aligned_(y) && f32_aligned_(x)) {
+        float *restrict yp = (float *)y.data + yo;          /* restrict: the contract above forbids overlap, and it is what */
+        const float *restrict xp = (const float *)x.data + xo; /* lets the compiler vectorize this loop */
+        for (int i = 0; i < n; i++) yp[i] += av * xp[i];
+    } else {
+        for (int i = 0; i < n; i++) {
+            float yv, xv;
+            memcpy(&yv, y.data + ((size_t)yo + (size_t)i) * 4u, 4);
+            memcpy(&xv, x.data + ((size_t)xo + (size_t)i) * 4u, 4);
+            yv += av * xv;
+            memcpy(y.data + ((size_t)yo + (size_t)i) * 4u, &yv, 4);
+        }
+    }
+}
+
+/* y[yo + i*ys] += a * x[xo+i], i in [0,n): the transposed-convolution scatter. ys may be any positive
+ * stride; the whole strided range is validated first. */
+static inline void f32_axpy_strided_impl(Bytes y, int yo, int ys, Bytes x, int xo, double a, int n) {
+    if (ys <= 0 || n <= 0 || !f32_range_ok_(x, xo, n)) return;
+    long last = (long)yo + (long)(n - 1) * (long)ys;
+    if (yo < 0 || last >= (long)(y.len / 4)) return;
+    const float av = (float)a;
+    for (int i = 0; i < n; i++) {
+        float yv, xv;
+        memcpy(&yv, y.data + ((size_t)yo + (size_t)i * (size_t)ys) * 4u, 4);
+        memcpy(&xv, x.data + ((size_t)xo + (size_t)i) * 4u, 4);
+        yv += av * xv;
+        memcpy(y.data + ((size_t)yo + (size_t)i * (size_t)ys) * 4u, &yv, 4);
+    }
+}
+
+/* sum_i x[xo+i] * y[yo+i], eight fixed partial sums combined in a fixed order (deterministic, and
+ * wide enough for the compiler to keep the lanes busy without fast-math). Accumulates in float32 like
+ * the reference runtime does; the final value is returned as F64. */
+static inline double f32_dot_impl(Bytes x, int xo, Bytes y, int yo, int n) {
+    if (!f32_range_ok_(x, xo, n) || !f32_range_ok_(y, yo, n)) return 0.0;
+    float acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        for (int l = 0; l < 8; l++) {
+            float xv, yv;
+            memcpy(&xv, x.data + ((size_t)xo + (size_t)(i + l)) * 4u, 4);
+            memcpy(&yv, y.data + ((size_t)yo + (size_t)(i + l)) * 4u, 4);
+            acc[l] += xv * yv;
+        }
+    }
+    float tail = 0.0f;
+    for (; i < n; i++) {
+        float xv, yv;
+        memcpy(&xv, x.data + ((size_t)xo + (size_t)i) * 4u, 4);
+        memcpy(&yv, y.data + ((size_t)yo + (size_t)i) * 4u, 4);
+        tail += xv * yv;
+    }
+    return (double)(((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail);
+}
+
+/* y[yo+i] *= a, i in [0,n) */
+static inline void f32_scale_impl(Bytes y, int yo, int n, double a) {
+    if (!f32_range_ok_(y, yo, n)) return;
+    const float av = (float)a;
+    for (int i = 0; i < n; i++) {
+        float v; memcpy(&v, y.data + ((size_t)yo + (size_t)i) * 4u, 4);
+        v *= av; memcpy(y.data + ((size_t)yo + (size_t)i) * 4u, &v, 4);
+    }
+}
+
+/* f32_load_le_impl -- decode `n` little-endian IEEE-754 float32 values starting at byte `byte_off` of a
+ * NUL-agnostic byte source (a String over an mmap'd weights file, see io/mmap.prn: strlen is never
+ * used, the caller passes the real length) into a fresh F32 buffer. Portable: assembles each float from
+ * four bytes, so it is correct on any host byte order. Out-of-range requests clamp to what exists. */
+static inline Bytes f32_load_le_impl(Arena *dest, const char *src, int src_len, int byte_off, int n) {
+    if (!src || n <= 0 || byte_off < 0 || byte_off > src_len) return bytes_alloc_impl(dest, 0);
+    int avail = (src_len - byte_off) / 4;
+    if (n > avail) n = avail;
+    Bytes b = f32_alloc_impl(dest, n);
+    for (int i = 0; i < n; i++) {
+        const unsigned char *p = (const unsigned char *)src + byte_off + (size_t)i * 4u;
+        unsigned int u = (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+        float f; memcpy(&f, &u, 4);
+        memcpy(b.data + (size_t)i * 4u, &f, 4);
+    }
+    return b;
+}
+
+/* ---- F32 elementwise / normalisation primitives (stdlib/tensor/nn.prn) -----------------------------------
+ * Same contract as the F32 block above: float offsets, ranges validated once, out-of-range = silent no-op.
+ * f32_unary_impl kinds: 0 RELU  1 LEAKY_RELU(p = negative slope)  2 TANH  3 SIGMOID  4 GELU_ERF (exact erf form,
+ * x * 0.5 * (1 + erf(x/sqrt 2)) -- NOT the tanh approximation, which moves a duration-predictor logit enough to flip a
+ * ceil)  5 EXP  6 NEG  7 SQRT  8 SOFTPLUS  9 RECIP  10 ADD_CONST(p)  11 MUL_CONST(p)  12 CLAMP_ABS(p = bound)
+ * Transcendentals come from libm (exp/tanh/erf): correct to ~1 ulp but not bit-identical across libm versions; bit-exact
+ * cross-machine audio would need PARENA-native replacements (tracked in docs/TTS_VITS_PORT_PLAN.md). */
+static inline void f32_unary_impl(Bytes y, int yo, int n, int kind, double p) {
+    if (!f32_range_ok_(y, yo, n)) return;
+    for (int i = 0; i < n; i++) {
+        float f; memcpy(&f, y.data + ((size_t)yo + (size_t)i) * 4u, 4);
+        double v = (double)f, r;
+        switch (kind) {
+            case 0: r = v > 0.0 ? v : 0.0; break;
+            case 1: r = v > 0.0 ? v : v * p; break;
+            case 2: r = tanh(v); break;
+            case 3: r = 1.0 / (1.0 + exp(-v)); break;
+            case 4: r = v * 0.5 * (1.0 + erf(v * 0.70710678118654752440)); break;
+            case 5: r = exp(v); break;
+            case 6: r = -v; break;
+            case 7: r = v > 0.0 ? sqrt(v) : 0.0; break;
+            case 8: r = v > 20.0 ? v : log(1.0 + exp(v)); break;
+            case 9: r = v != 0.0 ? 1.0 / v : 0.0; break;
+            case 10: r = v + p; break;
+            case 11: r = v * p; break;
+            case 12: r = v > p ? p : (v < -p ? -p : v); break;
+            default: return;
+        }
+        f = (float)r;
+        memcpy(y.data + ((size_t)yo + (size_t)i) * 4u, &f, 4);
+    }
+}
+
+/* y[yo+i] *= x[xo+i] */
+static inline void f32_mul_impl(Bytes y, int yo, Bytes x, int xo, int n) {
+    if (!f32_range_ok_(y, yo, n) || !f32_range_ok_(x, xo, n)) return;
+    for (int i = 0; i < n; i++) {
+        float a, b;
+        memcpy(&a, y.data + ((size_t)yo + (size_t)i) * 4u, 4);
+        memcpy(&b, x.data + ((size_t)xo + (size_t)i) * 4u, 4);
+        a *= b;
+        memcpy(y.data + ((size_t)yo + (size_t)i) * 4u, &a, 4);
+    }
+}
+
+/* In-place softmax over each of `rows` rows of length `cols` starting at float offset `off` (max-subtracted, so large
+ * logits cannot overflow). */
+static inline void f32_softmax_rows_impl(Bytes y, int off, int rows, int cols) {
+    if (rows <= 0 || cols <= 0 || off < 0 || off > y.len / 4 || (long)rows * (long)cols > (long)(y.len / 4 - off)) return;
+    for (int r = 0; r < rows; r++) {
+        size_t base = ((size_t)off + (size_t)r * (size_t)cols) * 4u;
+        float mx = -3.402823466e38f;
+        for (int c = 0; c < cols; c++) { float v; memcpy(&v, y.data + base + (size_t)c * 4u, 4); if (v > mx) mx = v; }
+        double sum = 0.0;
+        for (int c = 0; c < cols; c++) {
+            float v; memcpy(&v, y.data + base + (size_t)c * 4u, 4);
+            double e = exp((double)v - (double)mx); sum += e;
+            float ef = (float)e; memcpy(y.data + base + (size_t)c * 4u, &ef, 4);
+        }
+        for (int c = 0; c < cols; c++) {
+            float v; memcpy(&v, y.data + base + (size_t)c * 4u, 4);
+            v = (float)((double)v / sum); memcpy(y.data + base + (size_t)c * 4u, &v, 4);
+        }
+    }
+}
+
+/* Channel LayerNorm on a channel-first tensor x[C][T] (what a VITS/HiFi-GAN stack stores): for every time step t,
+ * normalise over the C channels with a biased variance, then scale by gamma[c] and shift by beta[c]:
+ *   y[c][t] = (x[c][t] - mean_t) / sqrt(var_t + eps) * gamma[c] + beta[c]
+ * (the form VITS uses for all its LayerNorms; "not nn.prn's whole-array layernorm"). Accumulates in double. */
+static inline void f32_layernorm_ct_impl(Bytes x, int off, int channels, int t_len, Bytes gamma, Bytes beta, double eps) {
+    if (channels <= 0 || t_len <= 0 || off < 0 || off > x.len / 4 || (long)channels * (long)t_len > (long)(x.len / 4 - off)) return;
+    if (gamma.len / 4 < channels || beta.len / 4 < channels) return;
+    for (int t = 0; t < t_len; t++) {
+        double mean = 0.0, var = 0.0;
+        for (int c = 0; c < channels; c++) { float v; memcpy(&v, x.data + ((size_t)off + (size_t)c * (size_t)t_len + (size_t)t) * 4u, 4); mean += (double)v; }
+        mean /= (double)channels;
+        for (int c = 0; c < channels; c++) { float v; memcpy(&v, x.data + ((size_t)off + (size_t)c * (size_t)t_len + (size_t)t) * 4u, 4); double d = (double)v - mean; var += d * d; }
+        var /= (double)channels;
+        double inv = 1.0 / sqrt(var + eps);
+        for (int c = 0; c < channels; c++) {
+            size_t pos = ((size_t)off + (size_t)c * (size_t)t_len + (size_t)t) * 4u;
+            float v, g, b; memcpy(&v, x.data + pos, 4); memcpy(&g, gamma.data + (size_t)c * 4u, 4); memcpy(&b, beta.data + (size_t)c * 4u, 4);
+            v = (float)(((double)v - mean) * inv * (double)g + (double)b);
+            memcpy(x.data + pos, &v, 4);
+        }
+    }
+}
+
+/* y[yo+i] = sum_{j<=i} x[xo+j]  (inclusive prefix sum, accumulated in double) */
+static inline void f32_cumsum_impl(Bytes y, int yo, Bytes x, int xo, int n) {
+    if (!f32_range_ok_(y, yo, n) || !f32_range_ok_(x, xo, n)) return;
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float v; memcpy(&v, x.data + ((size_t)xo + (size_t)i) * 4u, 4);
+        acc += (double)v;
+        float f = (float)acc; memcpy(y.data + ((size_t)yo + (size_t)i) * 4u, &f, 4);
+    }
+}
+
+/* Same-padding helper: dst[c][pad_l + t] = src[c][t], zeros elsewhere, for `channels` rows of length `t_len`, into rows of
+ * length t_len + pad_l + pad_r. dst must hold channels*(t_len+pad_l+pad_r) floats. */
+static inline void f32_pad_rows_impl(Bytes dst, Bytes src, int channels, int t_len, int pad_l, int pad_r) {
+    if (channels <= 0 || t_len <= 0 || pad_l < 0 || pad_r < 0) return;
+    long lp = (long)t_len + pad_l + pad_r;
+    if (lp > 0x7fffffffL || (long)channels * lp > (long)(dst.len / 4) || (long)channels * (long)t_len > (long)(src.len / 4)) return;
+    for (int c = 0; c < channels; c++) {
+        size_t db = (size_t)c * (size_t)lp * 4u;
+        memset(dst.data + db, 0, (size_t)lp * 4u);
+        memcpy(dst.data + db + (size_t)pad_l * 4u, src.data + (size_t)c * (size_t)t_len * 4u, (size_t)t_len * 4u);
+    }
+}
+
 #ifdef PARENA_WITH_MLDSA
 /* mldsa_keygen_impl/mldsa_sign_impl/mldsa_verify_impl -- real host glue for crypto/mldsa.prn,
  * calling straight into the vendored, unmodified (except for attribution) CRYSTALS-Dilithium
@@ -576,6 +846,98 @@ static inline int mldsa_verify_impl(Bytes sig, Bytes msg, Bytes pubkey) {
     return crypto_sign_verify(sig.data, (size_t)sig.len, msg.data, (size_t)msg.len, NULL, 0, pubkey.data);
 }
 #endif /* PARENA_WITH_MLDSA */
+
+#ifdef PARENA_WITH_MLKEM
+#include <stdint.h> /* uint8_t in the prototypes below; not guaranteed by earlier includes on mingw */
+/* mlkem_*_impl -- real host glue for crypto/mlkem.prn: ML-KEM-768 (FIPS 203), calling straight into
+ * the vendored, unmodified pq-crystals/kyber `standard` branch reference (runtime/mlkem/, CC0 /
+ * Apache-2.0). Cross-verified against Go's independent crypto/mlkem in both directions
+ * (100 rounds + implicit-rejection check; see tests/mlkem_interop/).
+ *
+ * Prototypes are declared here, NOT via mlkem/api.h: that header shares the `API_H` include guard
+ * with mldsa/api.h, so including both would silently drop one. Link note: mlkem/randombytes.c and
+ * mldsa/randombytes.c both define plain `randombytes` with identical signatures -- a consumer
+ * linking both libraries must compile only one of them.
+ *
+ * Fixed ML-KEM-768 sizes (FIPS 203): ek 1184, dk 2400, ct 1088, shared secret 32. Every impl
+ * validates input lengths and returns a zero-length Bytes on a mismatch (never reads out of bounds
+ * on a short caller-supplied buffer). */
+extern int pqcrystals_kyber768_ref_keypair(uint8_t *pk, uint8_t *sk);
+extern int pqcrystals_kyber768_ref_enc(uint8_t *ct, uint8_t *ss, const uint8_t *pk);
+extern int pqcrystals_kyber768_ref_dec(uint8_t *ss, const uint8_t *ct, const uint8_t *sk);
+#define MLKEM768_PK_BYTES 1184
+#define MLKEM768_SK_BYTES 2400
+#define MLKEM768_CT_BYTES 1088
+#define MLKEM768_SS_BYTES 32
+
+/* ek||dk as ONE Bytes (a #target body returns one value; same shape as mldsa_keygen_impl). */
+static inline Bytes mlkem_keygen_impl(Arena *dest) {
+    Bytes out = bytes_alloc_impl(dest, MLKEM768_PK_BYTES + MLKEM768_SK_BYTES);
+    pqcrystals_kyber768_ref_keypair(out.data, out.data + MLKEM768_PK_BYTES);
+    return out;
+}
+/* ct||ss, or zero-length if ek is not exactly 1184 bytes. */
+static inline Bytes mlkem_encaps_impl(Bytes ek, Arena *dest) {
+    if (ek.len != MLKEM768_PK_BYTES) return bytes_alloc_impl(dest, 0);
+    Bytes out = bytes_alloc_impl(dest, MLKEM768_CT_BYTES + MLKEM768_SS_BYTES);
+    pqcrystals_kyber768_ref_enc(out.data, out.data + MLKEM768_CT_BYTES, ek.data);
+    return out;
+}
+/* ss (32 bytes), or zero-length on wrong-sized ct/dk. A well-sized but tampered ct does NOT fail:
+ * FIPS 203 implicit rejection returns a pseudorandom secret, so the two sides simply disagree. */
+static inline Bytes mlkem_decaps_impl(Bytes ct, Bytes dk, Arena *dest) {
+    if (ct.len != MLKEM768_CT_BYTES || dk.len != MLKEM768_SK_BYTES) return bytes_alloc_impl(dest, 0);
+    Bytes out = bytes_alloc_impl(dest, MLKEM768_SS_BYTES);
+    pqcrystals_kyber768_ref_dec(out.data, ct.data, dk.data);
+    return out;
+}
+#endif /* PARENA_WITH_MLKEM */
+
+#ifdef PARENA_WITH_AEAD
+#include <stdint.h>
+/* aead_*_impl -- real host glue for crypto/aead.prn: XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha,
+ * 24-byte nonce so random nonces are safe), via the vendored, unmodified Monocypher 4.0.2
+ * (runtime/aead/, CC0 / BSD-2). Same design judgment as crypto/mlkem.prn: no hand-rolled crypto.
+ * Independently cross-checked against Go golang.org/x/crypto/chacha20poly1305 (tests/test_aead.c's
+ * known-answer vector was produced by Go's NewX).
+ * Wire shape: seal -> ciphertext||mac(16); open takes that same shape. Key 32, nonce 24 bytes
+ * (wrong sizes -> zero-length Bytes, no OOB). open failing (bad tag / too short) -> zero-length
+ * Bytes, so a legitimately EMPTY plaintext is indistinguishable from failure: callers must not
+ * seal empty payloads (secure_channel frames always carry a header byte). */
+#include "aead/monocypher.h"
+#define AEAD_KEY_BYTES 32
+#define AEAD_NONCE_BYTES 24
+#define AEAD_MAC_BYTES 16
+static inline Bytes aead_seal_impl(Bytes key, Bytes nonce, Bytes ad, Bytes plain, Arena *dest) {
+    if (key.len != AEAD_KEY_BYTES || nonce.len != AEAD_NONCE_BYTES) return bytes_alloc_impl(dest, 0);
+    Bytes out = bytes_alloc_impl(dest, plain.len + AEAD_MAC_BYTES);
+    crypto_aead_lock(out.data, out.data + plain.len, key.data, nonce.data,
+                     ad.data, (size_t)ad.len, plain.data, (size_t)plain.len);
+    return out;
+}
+static inline Bytes aead_open_impl(Bytes key, Bytes nonce, Bytes ad, Bytes sealed, Arena *dest) {
+    if (key.len != AEAD_KEY_BYTES || nonce.len != AEAD_NONCE_BYTES || sealed.len <= AEAD_MAC_BYTES)
+        return bytes_alloc_impl(dest, 0);
+    int n = sealed.len - AEAD_MAC_BYTES;
+    Bytes out = bytes_alloc_impl(dest, n);
+    if (crypto_aead_unlock(out.data, sealed.data + n, key.data, nonce.data,
+                           ad.data, (size_t)ad.len, sealed.data, (size_t)n) != 0)
+        return bytes_alloc_impl(dest, 0);
+    return out;
+}
+/* aead_kdf_impl -- 32-byte BLAKE2b of secret||label (Monocypher). Domain-separated key derivation
+ * for the secure channel: one ML-KEM shared secret -> an independent key per direction. The
+ * secret is already uniformly random (ML-KEM output), so a plain hash is a sound KDF here;
+ * label must be distinct per use. Also used as the 32-byte key fingerprint. */
+static inline Bytes aead_kdf_impl(Bytes secret, Bytes label, Arena *dest) {
+    Bytes out = bytes_alloc_impl(dest, 32);
+    Bytes buf = bytes_alloc_impl(dest, secret.len + label.len);
+    if (secret.len) memcpy(buf.data, secret.data, (size_t)secret.len);
+    if (label.len) memcpy(buf.data + secret.len, label.data, (size_t)label.len);
+    crypto_blake2b(out.data, 32, buf.data, (size_t)buf.len);
+    return out;
+}
+#endif /* PARENA_WITH_AEAD */
 
 /* string_concat -- real, minimal `string/concat` implementation
  * (STDLIB.md's own "string" package design), found genuinely missing

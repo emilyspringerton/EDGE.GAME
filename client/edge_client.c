@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "usb_probe.h"
+#include "../common/sec_transport.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -59,11 +60,16 @@ static sock_t connect_to(const char *host, int port) {
     return s;
 }
 
+/* The one encrypted connection (ML-KEM-768 + LZ4 + XChaCha20-Poly1305, common/sec_transport.h);
+ * every line the client sends goes through it, so nothing below touches the raw socket again. */
+static SecConn g_sec;
+
 static int send_line(sock_t s, const char *json) {
     char buf[16384];
     int n = snprintf(buf, sizeof(buf), "%s\n", json);
+    (void)s;
     if (n < 0 || (size_t)n >= sizeof(buf)) return 0;
-    return send(s, buf, n, 0) == n;
+    return sec_send(&g_sec, buf, (size_t)n) == 0;
 }
 
 /* extract_str -- pulls a bare "field":"value" string out of a flat JSON object. */
@@ -134,15 +140,36 @@ int main(int argc, char **argv) {
     sock_t s = connect_to(host, port);
     if (s == INVALID_SOCKET) { fprintf(stderr, "connect failed\n"); return 1; }
 
+    {
+        unsigned char pin[SEC_PIN_BYTES];
+        const char *pin_hex = argc > 4 ? argv[4] : getenv("EDGE_SERVER_PIN");
+        char hostport[200];
+        SecPinPolicy pol;
+        snprintf(hostport, sizeof(hostport), "%s:%d", host, port);
+        pol.pin = (pin_hex && *pin_hex && sec_unhex(pin_hex, pin, sizeof(pin)) == 0) ? pin : NULL;
+        pol.tofu_file = "edge_known_servers.txt";
+        pol.hostport = hostport;
+        if (pin_hex && *pin_hex && !pol.pin) { fprintf(stderr, "EDGE_SERVER_PIN must be 64 hex chars\n"); return 1; }
+        int hs = sec_client_handshake(&g_sec, (int)s, sec_verify_pin_or_tofu, &pol);
+        if (hs != 0) { fprintf(stderr, "secure handshake failed (%d)\n", hs); return 1; }
+    }
+
     char hello[512];
     snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"token\":\"%s\"}", token);
     send_line(s, hello);
 
-    char buf[4096];
+    static char buf[70000];
+    static unsigned char plain[SEC_MAX_PLAIN];
     size_t buflen = 0;
     for (;;) {
-        int n = recv(s, buf + buflen, sizeof(buf) - buflen - 1, 0);
-        if (n <= 0) { fprintf(stderr, "connection closed\n"); break; }
+        long n = sec_next(&g_sec, plain, sizeof(plain));
+        if (n < 0) { fprintf(stderr, "secure channel: authentication/protocol failure\n"); break; }
+        if (n == 0) {
+            if (sec_fill(&g_sec) <= 0) { fprintf(stderr, "connection closed\n"); break; }
+            continue;
+        }
+        if (buflen + (size_t)n >= sizeof(buf)) buflen = 0; /* overflow-drop, never overrun */
+        memcpy(buf + buflen, plain, (size_t)n);
         buflen += (size_t)n;
         buf[buflen] = '\0';
 

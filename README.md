@@ -38,6 +38,22 @@ real-verified: a clean `-Wall -Wextra -pedantic -Werror` PE32+ binary, since tha
 written portable against `_WIN32`/winsock2 but this was the first time that path was actually
 exercised), bundles a flat `edge_client_windows.zip` (exe + `PLAY.bat`), and auto-tags/releases on
 every green `main` push — same pattern `DEADWEIGHT_2/.github/workflows/ci.yml` already proves live.
+**Encrypted transport (card #491, all PARENA crypto):** every socket (cabinet port, operator port, Pi
+events) is ML-KEM-768 (post-quantum key exchange) + LZ4 (real block format, `compress/lz4_block.prn`)
++ XChaCha20-Poly1305, via `PARENA/stdlib/net/secure_channel.prn` through `common/sec_transport.c`.
+There is **no plaintext mode**. The relay prints its fingerprint at startup (key persisted in
+`EDGE_KEY_FILE`, default `edge_relay.key`, mode 0600); clients pin it with `EDGE_SERVER_PIN` or fall
+back to trust-on-first-use (`edge_known_servers.txt`, loud on first contact, refuses a changed key).
+`edge_ctl <host> <port> <token> [--pin HEX] [--wait S] [--follow S] [--stdin] [json ...]` is the
+operator/device CLI (what the Pi's boot announce and `make test-e2e` drive; `--stdin` holds one live
+session open). Verified: `make test-e2e` (21 checks incl. wrong pin, plaintext refused, TOFU mismatch,
+idle-connection reaping) plus PARENA's `make test-secure-channel` / `test-lz4-block` (decodes liblz4
+output and liblz4 decodes ours) / `test-aead` (Go x/crypto known-answer). **Honest limits:** LZ4 before
+encryption leaks message length/compressibility (inherent to the requested design; the auth token is
+in its own frame, never mixed with attacker-controlled text); per-direction frame counters are 32-bit
+(re-handshake before 2^31 frames -- not enforced yet); the server key is not rotated automatically;
+the Windows/mingw `edge_client.exe`/`edge_ctl.exe` build and link but have not been run on Windows.
+
 **USB/COM probe (card #493):** `edge_client probe` (or the relay's `usb_probe` operator command)
 finds the Feather 32u4 by USB VID/PID, reports its COM port and whether it is running a sketch
 (`239A:800C`) or in the Caterina bootloader (`239A:000C`), also classifies Nano (CH340/FTDI) and Pi

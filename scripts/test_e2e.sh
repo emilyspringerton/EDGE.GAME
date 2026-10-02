@@ -10,6 +10,10 @@
 # AND the operator port -- the old HTTP operator API is gone, since PARENA has no HTTP-server
 # stdlib and unifying transports is simpler than inventing one).
 #
+# Secure transport (card #491): every socket is ML-KEM-768 + LZ4 + XChaCha20-Poly1305; the test
+# drives the relay only through build/edge_ctl / build/edge_client (the real encrypted clients), and
+# checks plaintext, bad pins and wrong tokens are all refused.
+#
 # Proves: cabinet connect+route (unchanged Phase-1 claim, PARENA/stdlib/edge_game/
 # traffic_router.prn's own real routing decision), operator command forwarding, wrong-token
 # rejection, AND the new REFLUX events channel (a device/Pi pushing a "boot" event, buffered
@@ -23,6 +27,7 @@ set -euo pipefail
 : "${EDGE_OPERATOR_PORT:?}"
 : "${EDGE_PI_TOKEN:=e2e-pi-secret}"
 
+WORKDIR="$(mktemp -d)"
 RELAY_LOG="$(mktemp)"
 CLIENT_LOG="$(mktemp)"
 RELAY_PID=""
@@ -32,23 +37,32 @@ cleanup() {
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
   [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null || true
   wait 2>/dev/null || true
-  rm -f "$RELAY_LOG" "$CLIENT_LOG"
+  rm -rf "$RELAY_LOG" "$CLIENT_LOG" "$WORKDIR"
 }
 trap cleanup EXIT
 
-EDGE_PI_TOKEN="$EDGE_PI_TOKEN" ./build/edge_relay > "$RELAY_LOG" 2>&1 &
+export EDGE_KEY_FILE="$WORKDIR/relay.key"
+cd "$WORKDIR" # edge_known_servers.txt (TOFU) lands here, not in the repo
+BIN="$OLDPWD/build"
+
+EDGE_HANDSHAKE_DEADLINE_S=2 EDGE_PI_TOKEN="$EDGE_PI_TOKEN" "$BIN/edge_relay" > "$RELAY_LOG" 2>&1 &
 RELAY_PID=$!
-sleep 0.3
+sleep 0.5
+PIN="$(sed -n 's/.*clients pin this): //p' "$RELAY_LOG")"
+[ ${#PIN} -eq 64 ] || { echo "FAIL: relay did not print a 64-hex fingerprint"; cat "$RELAY_LOG"; exit 1; }
+export EDGE_SERVER_PIN="$PIN"
 
-./build/edge_client 127.0.0.1 "$EDGE_CLIENT_PORT" "$EDGE_CLIENT_TOKEN" > "$CLIENT_LOG" 2>&1 &
+"$BIN/edge_client" 127.0.0.1 "$EDGE_CLIENT_PORT" "$EDGE_CLIENT_TOKEN" > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
-sleep 0.3
+sleep 0.5
 
-EDGE_OPERATOR_PORT="$EDGE_OPERATOR_PORT" EDGE_OPERATOR_TOKEN="$EDGE_OPERATOR_TOKEN" \
-EDGE_PI_TOKEN="$EDGE_PI_TOKEN" python3 - <<'PYEOF'
-import json, os, socket, sys, time
+BIN="$BIN" PIN="$PIN" EDGE_OPERATOR_PORT="$EDGE_OPERATOR_PORT" EDGE_OPERATOR_TOKEN="$EDGE_OPERATOR_TOKEN" \
+EDGE_PI_TOKEN="$EDGE_PI_TOKEN" EDGE_CLIENT_PORT="$EDGE_CLIENT_PORT" python3 - <<'PYEOF'
+import json, os, select, socket, subprocess, sys, time
 
 fail = [0]
+BIN = os.environ["BIN"]
+PORT = os.environ["EDGE_OPERATOR_PORT"]
 
 def check(desc, want, got):
     if got != want:
@@ -57,86 +71,134 @@ def check(desc, want, got):
     else:
         print(f"PASS: {desc}")
 
-def connect():
-    return socket.create_connection(("127.0.0.1", int(os.environ["EDGE_OPERATOR_PORT"])), timeout=3)
+class Conn:
+    """One live encrypted session: an edge_ctl --stdin child (it does the ML-KEM handshake)."""
+    def __init__(self, token, extra=()):
+        self.p = subprocess.Popen([BIN + "/edge_ctl", "127.0.0.1", PORT, token, "--follow", "60", "--stdin", *extra],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.buf = b""
+    def send(self, obj):
+        self.p.stdin.write((json.dumps(obj, separators=(",", ":")) + "\n").encode()); self.p.stdin.flush()
+    def recv(self, timeout=3):
+        end = time.time() + timeout
+        while b"\n" not in self.buf:
+            left = end - time.time()
+            if left <= 0: return ""
+            r, _, _ = select.select([self.p.stdout], [], [], left)
+            if not r: return ""
+            chunk = os.read(self.p.stdout.fileno(), 65536)
+            if not chunk: return ""
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line.decode()
+    def close(self):
+        self.p.kill(); self.p.wait()
 
-def send(s, obj):
-    s.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode())
-
-def recv_line(s, timeout=3):
-    s.settimeout(timeout)
-    buf = b""
-    try:
-        while b"\n" not in buf:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-    except socket.timeout:
-        pass
-    return buf.decode().strip()
-
-op = connect()
-send(op, {"type": "hello", "token": os.environ["EDGE_OPERATOR_TOKEN"]})
-hello = json.loads(recv_line(op))
-check("operator hello_ok", "operator", hello.get("role"))
+op = Conn(os.environ["EDGE_OPERATOR_TOKEN"])
+hello = json.loads(op.recv())
+check("operator hello_ok (over the encrypted channel)", "operator", hello.get("role"))
 
 def route(source, cid):
-    send(op, {"id": cid, "type": "route", "payload": {"source": source}})
-    resp = json.loads(recv_line(op))
-    return resp.get("target")
+    op.send({"id": cid, "type": "route", "payload": {"source": source}})
+    return json.loads(op.recv()).get("target")
 
 check("source 1 (Windows) fans out to Pi+Nano", "ToPiAndNano", route(1, "c1"))
 check("source 2 (Nano) relays to Windows", "ToWindows", route(2, "c2"))
 check("source 3 (Pi) relays to Windows", "ToWindows", route(3, "c3"))
 
-send(op, {"id": "c4", "type": "ping", "payload": {}})
-ack = json.loads(recv_line(op))
-check("unrelated command type gets a generic ack", "ack", ack.get("type"))
+op.send({"id": "c4", "type": "ping", "payload": {}})
+check("unrelated command type gets a generic ack", "ack", json.loads(op.recv()).get("type"))
 
-# usb_probe (card #493): the operator asks the cabinet client to probe its host's USB/COM ports.
-# This sandbox has no USB serial devices, so the honest expected result is count 0 + feather null
-# + the data-cable hint; the point is the command round-trips through relay -> client -> relay.
-send(op, {"id": "c5", "type": "usb_probe", "payload": {}})
-pr = json.loads(recv_line(op))
+# usb_probe round-trips relay -> cabinet client -> relay (no USB serial in this sandbox: devices []).
+op.send({"id": "c5", "type": "usb_probe", "payload": {}})
+pr = json.loads(op.recv())
 check("usb_probe round-trips with a result type", "usb_probe_result", pr.get("type"))
 check("usb_probe result carries a devices list + feather field", True, isinstance(pr.get("devices"), list) and "feather" in pr)
 
-# Wrong operator token: the connection should be closed (no hello_ok), not silently accepted.
-bad = connect()
-send(bad, {"type": "hello", "token": "wrong-token"})
-bad_resp = recv_line(bad, timeout=2)
-check("wrong operator token gets no hello_ok (connection closed)", "", bad_resp)
+# ---- security checks ----
+# Wrong operator token: edge_ctl exits 3 ("hello refused").
+bad = subprocess.run([BIN + "/edge_ctl", "127.0.0.1", PORT, "wrong-token"], capture_output=True, timeout=10)
+check("wrong operator token is refused (exit 3)", 3, bad.returncode)
 
-# REFLUX events channel: a device (Pi) pushes a boot event; buffered events_since sees it even
-# though nobody was subscribed when it fired; a live subscriber sees a SECOND boot event pushed
-# without polling.
-device = connect()
-send(device, {"type": "hello", "token": os.environ["EDGE_PI_TOKEN"]})
-dev_hello = json.loads(recv_line(device))
-check("device hello_ok", "device", dev_hello.get("role"))
+# Wrong pin: refused at the handshake, before any secret is sent (exit 2).
+badpin = subprocess.run([BIN + "/edge_ctl", "127.0.0.1", PORT, os.environ["EDGE_OPERATOR_TOKEN"], "--pin", "00" * 32],
+                        capture_output=True, timeout=10)
+check("wrong server pin refused at handshake (exit 2)", 2, badpin.returncode)
 
-send(device, {"type": "event", "event": "boot", "pi_id": 1})
-time.sleep(0.2)
+# Plaintext client: sends NDJSON hello in the clear; the relay must not answer hello_ok.
+raw = socket.create_connection(("127.0.0.1", int(PORT)), timeout=3)
+drained = b""
+while len(drained) < 4 + 1187:  # drain the server's hello (length prefix + magic + ek)
+    drained += raw.recv(4096)
+raw.sendall(json.dumps({"type": "hello", "token": os.environ["EDGE_OPERATOR_TOKEN"]}).encode() + b"\n")
+raw.settimeout(1.5)
+try:
+    got = raw.recv(4096)
+except socket.timeout:
+    got = b""
+check("plaintext hello is never answered with hello_ok", False, b"hello_ok" in got)
+raw.close()
 
-send(op, {"type": "events_since", "since": 0})
-ev = json.loads(recv_line(op))
-items = ev.get("items", [])
+# What the server sends first is magic + ML-KEM ek only: no plaintext protocol text anywhere.
+raw = socket.create_connection(("127.0.0.1", int(PORT)), timeout=3)
+first = b""
+while len(first) < 4 + 1187:
+    c = raw.recv(4096)
+    if not c: break
+    first += c
+check("server speaks first with the 1187-byte ES1+ek hello", 4 + 1187, len(first))
+check("server hello starts with the ES1 magic", b"ES1", first[4:7])
+raw.close()
+
+# Slow-loris guard: a socket that connects and then says nothing is dropped after the (test: 2s) deadline.
+idle = socket.create_connection(("127.0.0.1", int(PORT)), timeout=3)
+drained = b""
+while len(drained) < 4 + 1187:
+    drained += idle.recv(4096)
+idle.settimeout(6)
+try:
+    closed = idle.recv(1) == b""
+except socket.timeout:
+    closed = False
+check("idle half-open connection is reaped after the handshake deadline", True, closed)
+idle.close()
+
+# TOFU: with no pin in the env, first contact records the fingerprint, and a second contact matches it.
+env = {k: v for k, v in os.environ.items() if k != "EDGE_SERVER_PIN"}
+t1 = subprocess.run([BIN + "/edge_ctl", "127.0.0.1", PORT, os.environ["EDGE_OPERATOR_TOKEN"], "--wait", "0.2"],
+                    capture_output=True, timeout=10, env=env)
+check("TOFU first contact succeeds and announces itself", True, t1.returncode == 0 and b"FIRST CONTACT" in t1.stderr)
+t2 = subprocess.run([BIN + "/edge_ctl", "127.0.0.1", PORT, os.environ["EDGE_OPERATOR_TOKEN"], "--wait", "0.2"],
+                    capture_output=True, timeout=10, env=env)
+check("TOFU second contact matches silently", True, t2.returncode == 0 and b"FIRST CONTACT" not in t2.stderr)
+open("edge_known_servers.txt", "w").write("127.0.0.1:%s %s\n" % (PORT, "11" * 32))
+t3 = subprocess.run([BIN + "/edge_ctl", "127.0.0.1", PORT, os.environ["EDGE_OPERATOR_TOKEN"], "--wait", "0.2"],
+                    capture_output=True, timeout=10, env=env)
+check("TOFU mismatch (swapped key) is refused", 2, t3.returncode)
+
+# ---- REFLUX events channel (a Pi pushing "boot", buffered + live) ----
+device = Conn(os.environ["EDGE_PI_TOKEN"])
+check("device hello_ok", "device", json.loads(device.recv()).get("role"))
+device.send({"type": "event", "event": "boot", "pi_id": 1})
+time.sleep(0.3)
+
+op.send({"type": "events_since", "since": 0})
+items = json.loads(op.recv()).get("items", [])
 check("events_since sees the buffered boot event", 1, len(items))
 if items:
     check("boot event action_type is REFLUX_ACTION_PI_BOOTED", 1, items[0].get("action_type"))
     check("boot event payload a is the real pi_id", 1, items[0].get("a"))
 
-sub = connect()
-send(sub, {"type": "hello", "token": os.environ["EDGE_OPERATOR_TOKEN"]})
-recv_line(sub)
-send(sub, {"type": "events_subscribe", "since": 999999})
-recv_line(sub)  # the immediate catch-up flush (empty, since=999999 skips everything retained)
-send(device, {"type": "event", "event": "boot", "pi_id": 2})
-live = json.loads(recv_line(sub))
+sub = Conn(os.environ["EDGE_OPERATOR_TOKEN"])
+sub.recv()
+sub.send({"type": "events_subscribe", "since": 999999})
+sub.recv()
+device.send({"type": "event", "event": "boot", "pi_id": 2})
+live = json.loads(sub.recv())
 check("live subscriber receives the second boot event without polling", "event", live.get("type"))
 check("live push carries the real pi_id", 2, live.get("a"))
 
+for c in (op, device, sub): c.close()
 sys.exit(1 if fail[0] else 0)
 PYEOF
 status=$?

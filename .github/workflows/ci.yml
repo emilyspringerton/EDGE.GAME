@@ -116,6 +116,7 @@ jobs:
           set -euo pipefail
           mkdir -p release_bin
           cp build/edge_client release_bin/
+          cp build/edge_ctl release_bin/
           cp build/edge_relay release_bin/
           cp EDGE_GAME_CONSTRUCT.txt release_bin/
 
@@ -145,9 +146,9 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf pkg/win && mkdir -p pkg/win
-          cp build/edge_client.exe pkg/win/
+          cp build/edge_client.exe build/edge_ctl.exe pkg/win/
           printf '%s\r\n' "start edge_client.exe" > pkg/win/PLAY.bat
-          (cd pkg/win && zip -q ../../edge_client_windows.zip edge_client.exe PLAY.bat)
+          (cd pkg/win && zip -q ../../edge_client_windows.zip edge_client.exe edge_ctl.exe PLAY.bat)
 
       - name: Stage release binaries
         run: |
@@ -183,6 +184,7 @@ jobs:
           set -euo pipefail
           mkdir out
           cp artifacts/EDGE_GAME_Release_Bin_*/edge_client "out/edge_client_linux_x86_64"
+          cp artifacts/EDGE_GAME_Release_Bin_*/edge_ctl "out/edge_ctl_linux_x86_64"
           cp artifacts/EDGE_GAME_Release_Bin_*/edge_relay "out/edge_relay_linux_x86_64"
           cp artifacts/EDGE_GAME_Release_Bin_*/EDGE_GAME_CONSTRUCT.txt out/
           cp artifacts/EDGE_GAME_ReleaseWin_Bin_*/edge_client_windows.zip out/
