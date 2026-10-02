@@ -24,6 +24,7 @@
 
 CC ?= gcc
 PARENA_ROOT ?= ../PARENA
+PARENA_ABS := $(abspath $(PARENA_ROOT))
 LLVM_TOOLCHAIN_ROOT ?= $(HOME)/.local/opt/llvm-toolchain
 LLC := $(LLVM_TOOLCHAIN_ROOT)/usr/lib/llvm-18/bin/llc
 LLVM_LIB_PATH := $(LLVM_TOOLCHAIN_ROOT)/usr/lib/x86_64-linux-gnu:$(LLVM_TOOLCHAIN_ROOT)/usr/lib/llvm-18/lib
@@ -41,10 +42,10 @@ SEC_DEFS = -DPARENA_WITH_MLKEM -DPARENA_WITH_AEAD
 SEC_SRCS = common/sec_transport.c client/runtime/parena_runtime.c
 
 regen-sc:
-	cd $(PARENA_ROOT) && ./parena build stdlib/string.prn stdlib/bytes.prn stdlib/crypto/aead.prn \
+	cd $(PARENA_ABS) && ./parena build stdlib/string.prn stdlib/bytes.prn stdlib/crypto/aead.prn \
 		stdlib/compress/lz4_block.prn stdlib/crypto/mlkem.prn stdlib/net/secure_channel.prn \
-		-o ../EDGE.GAME/vendor/sc/sc_gen.c
-	cp $(PARENA_ROOT)/runtime/parena_runtime.h client/runtime/parena_runtime.h
+		-o $(CURDIR)/vendor/sc/sc_gen.c
+	cp $(PARENA_ABS)/runtime/parena_runtime.h client/runtime/parena_runtime.h
 
 # build/libvendor.a -- vendored mlkem + monocypher, native; build/libvendor_win.a -- same for mingw.
 build/libvendor.a: $(wildcard vendor/mlkem/*.c) vendor/aead/monocypher.c | build
@@ -103,8 +104,8 @@ test-usb-probe: build
 # and the real, no-sudo-acquired LLVM toolchain PARENA/docs/LLVM_BACKEND_NORTHSTAR.md documents
 # acquiring (`apt-get download llvm-18 clang-18 ...` + `dpkg -x`).
 relay: build build/libvendor.a
-	cd $(PARENA_ROOT) && ./parena build stdlib/reflux/reflux.prn -o ../EDGE.GAME/server/reflux_gen.ll
-	cd $(PARENA_ROOT) && ./parena build stdlib/net/tcp_llvm.prn -o ../EDGE.GAME/server/tcp_llvm_gen.ll
+	cd $(PARENA_ABS) && ./parena build stdlib/reflux/reflux.prn -o $(CURDIR)/server/reflux_gen.ll
+	cd $(PARENA_ABS) && ./parena build stdlib/net/tcp_llvm.prn -o $(CURDIR)/server/tcp_llvm_gen.ll
 	LD_LIBRARY_PATH=$(LLVM_LIB_PATH) $(LLC) -mtriple=x86_64-pc-linux-gnu -filetype=obj \
 		server/reflux_gen.ll -o server/reflux_gen.o
 	LD_LIBRARY_PATH=$(LLVM_LIB_PATH) $(LLC) -mtriple=x86_64-pc-linux-gnu -filetype=obj \

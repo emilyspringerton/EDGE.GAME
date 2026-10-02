@@ -81,23 +81,14 @@ jobs:
           path: PARENA
       - name: Build parena compiler
         run: cd PARENA && make build
-      - name: Acquire no-sudo LLVM/clang toolchain
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.local/opt/llvm-toolchain"
-          cd /tmp
-          for pkg in llvm-18 clang-18 libllvm18 libclang-cpp18 libclang1-18 libobjc4 llvm-18-linker-tools; do
-            apt-get download "$pkg" 2>/dev/null || true
-          done
-          for deb in *.deb; do
-            [ -f "$deb" ] && dpkg -x "$deb" "$HOME/.local/opt/llvm-toolchain"
-          done
+      - name: Install LLVM 18 (llc) from apt
+        run: sudo apt-get install -y llvm-18
       - name: Build relay
         run: |
-          LLVM_TOOLCHAIN_ROOT="$HOME/.local/opt/llvm-toolchain" make relay
+          PARENA_ROOT="$PWD/PARENA" LLVM_TOOLCHAIN_ROOT=/ make relay
       - name: Run make test-e2e
         run: |
-          LLVM_TOOLCHAIN_ROOT="$HOME/.local/opt/llvm-toolchain" make test-e2e
+          PARENA_ROOT="$PWD/PARENA" LLVM_TOOLCHAIN_ROOT=/ make test-e2e
 
       - name: Generate Source Construct
         run: |
