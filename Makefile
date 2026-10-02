@@ -133,7 +133,7 @@ run-relay: relay
 # the replies, exercises the REFLUX events channel (buffered + live), then shuts both down. See
 # NORTHSTAR.md's own phased plan for what this proves and doesn't.
 test-e2e: client relay edge-ctl
-	EDGE_CLIENT_TOKEN=e2e-client-secret EDGE_OPERATOR_TOKEN=e2e-operator-secret \
+	PARENA_ROOT=$(PARENA_ABS) EDGE_CLIENT_TOKEN=e2e-client-secret EDGE_OPERATOR_TOKEN=e2e-operator-secret \
 	EDGE_CLIENT_PORT=18091 EDGE_OPERATOR_PORT=18092 \
 	bash scripts/test_e2e.sh
 

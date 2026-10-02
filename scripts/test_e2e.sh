@@ -277,6 +277,36 @@ nof = json.loads(op.recv(15))
 check("flash_hex with no Feather attached explains what to do", (False, True), (nof.get("ok"), "no Feather" in nof.get("error", "")))
 fsub.close()
 
+# ---- editor_set / editor_get (card #475) + the whole Claude loop scripts/edge_flash.sh (card #477) ----
+op.send({"id": "e1", "type": "editor_set", "payload": {}, "name": "blink.prn", "text": ";; via relay\n(defn next-led-state [(current : Bool)] : Bool\n  (not current))\n"})
+es = json.loads(op.recv(5))
+check("editor_set writes the editor's file next to the client", (True, "blink.prn"), (es.get("ok"), es.get("name")))
+op.send({"id": "e2", "type": "editor_get", "payload": {}, "name": "blink.prn"})
+eg = json.loads(op.recv(5))
+check("editor_get reads it back verbatim (newlines + parens)", ";; via relay\n(defn next-led-state [(current : Bool)] : Bool\n  (not current))\n", eg.get("text"))
+op.send({"id": "e3", "type": "editor_set", "payload": {}, "name": "../evil.prn", "text": "x"})
+check("editor_set refuses path traversal", False, json.loads(op.recv(5)).get("ok"))
+op.send({"id": "e4", "type": "editor_set", "payload": {}, "name": "x.exe", "text": "x"})
+check("editor_set refuses a non-document extension", False, json.loads(op.recv(5)).get("ok"))
+op.send({"id": "e5", "type": "editor_get", "payload": {}, "name": "missing.prn"})
+check("editor_get on a missing file reports ok:false", False, json.loads(op.recv(5)).get("ok"))
+
+fm2, fs2 = pty.openpty(); tty.setraw(fm2)
+sim2 = Sim(fm2); sim2.start()
+PARENA = os.environ.get("PARENA_ROOT") or (os.environ["REPO_DIR"] + "/../PARENA")
+prn = PARENA + "/examples/avr/blink.prn"
+avr = os.environ.get("AVR_TOOLCHAIN_ROOT", os.path.expanduser("~/.local/opt/avr-toolchain")) + "/usr/bin/avr-gcc"
+if os.path.exists(prn) and os.path.exists(PARENA + "/parena") and os.path.exists(avr):
+    env2 = dict(os.environ, PARENA_ROOT=PARENA, EDGE_RELAY_OPERATOR_PORT=PORT, EDGE_BOOTLOADER_PORT=os.ttyname(fs2), EDGE_CTL=BIN + "/edge_ctl")
+    r = subprocess.run([os.environ["REPO_DIR"] + "/scripts/edge_flash.sh", prn], capture_output=True, text=True, timeout=120, env=env2)
+    check("edge_flash.sh: editor sync + server compile + flash through the relay reports ok", True, '"flash_result"' in r.stdout and '"ok":true' in r.stdout)
+    check("edge_flash.sh synced the program into the editor file", True, "editor_set -> " in r.stdout and '"ok":true' in r.stdout.split("editor_set -> ")[1])
+    time.sleep(0.2)
+    check("the flashed image is the server-compiled blink (reset vector table present)", True, bytes(sim2.flash[:4]) == bytes.fromhex("0C945600"))
+else:
+    print("SKIP: edge_flash.sh end-to-end needs a sibling ../PARENA with parena built AND avr-gcc (AVR_TOOLCHAIN_ROOT)")
+sim2.stop = True
+
 for c in (op, device, sub): c.close()
 sys.exit(1 if fail[0] else 0)
 PYEOF

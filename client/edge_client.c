@@ -68,11 +68,16 @@ static sock_t connect_to(const char *host, int port) {
 static SecConn g_sec;
 
 static int send_line(sock_t s, const char *json) {
-    char buf[16384];
-    int n = snprintf(buf, sizeof(buf), "%s\n", json);
+    size_t len = strlen(json);
+    char *buf = (char *)malloc(len + 2); /* heap: editor_get / logs can exceed any fixed stack buffer */
+    int rc;
     (void)s;
-    if (n < 0 || (size_t)n >= sizeof(buf)) return 0;
-    return sec_send(&g_sec, buf, (size_t)n) == 0;
+    if (!buf) return 0;
+    memcpy(buf, json, len);
+    buf[len] = '\n';
+    rc = sec_send(&g_sec, buf, len + 1) == 0;
+    free(buf);
+    return rc;
 }
 
 /* extract_str -- pulls a bare "field":"value" string out of a flat JSON object. */
@@ -335,6 +340,79 @@ static void handle_flash_hex(sock_t s, const char *id, const char *line) {
     send_line(s, resp);
 }
 
+
+/* ---- editor_set / editor_get (card #475) ---------------------------------------------------------
+ * The relay's operator (Claude) edits the file the EDITOR.GAME window has open: editor_set writes it in
+ * the client's working directory (the same directory the editor was launched in), and the editor picks
+ * the change up by itself (EDITOR.GAME polls the file's mtime and reloads when its own buffer is clean).
+ * editor_get reads the current text back. Names are restricted to a plain file name with a known
+ * extension -- no paths, no "..", so a command can only touch editor documents next to the client. */
+#define EDITOR_TEXT_MAX 48000
+static int editor_name_ok(const char *n) {
+    size_t i, len = strlen(n);
+    const char *dot = strrchr(n, '.');
+    if (len == 0 || len > 60 || !dot || dot == n) return 0;
+    for (i = 0; i < len; i++) {
+        char c = n[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) return 0;
+    }
+    if (strstr(n, "..")) return 0;
+    return strcmp(dot, ".prn") == 0 || strcmp(dot, ".ino") == 0 || strcmp(dot, ".c") == 0 || strcmp(dot, ".txt") == 0 || strcmp(dot, ".md") == 0;
+}
+
+static void editor_default_name(char *name, size_t cap) {
+    const char *env = getenv("EDGE_EDITOR_FILE");
+    snprintf(name, cap, "%s", env && *env ? env : "blink.prn");
+}
+
+static void handle_editor_set(sock_t s, const char *id, const char *line) {
+    char name[80] = {0}, resp[500];
+    char *text = (char *)malloc(EDITOR_TEXT_MAX + 1);
+    size_t n;
+    FILE *f;
+    int ok = 0;
+    const char *err = "";
+    if (!text) return;
+    if (!extract_str(line, "name", name, sizeof(name))) editor_default_name(name, sizeof(name));
+    if (!editor_name_ok(name)) err = "bad name: plain file name with extension .prn/.ino/.c/.txt/.md only";
+    else if (!extract_str_unescaped_n(line, "text", text, EDITOR_TEXT_MAX + 1)) err = "missing text";
+    else if ((n = strlen(text)) >= EDITOR_TEXT_MAX) err = "text too large (limit 48000 bytes)";
+    else if (!(f = fopen(name, "wb"))) err = "cannot write the file";
+    else { fwrite(text, 1, n, f); fclose(f); ok = 1; }
+    snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"editor_set_result\",\"ok\":%s,\"name\":\"%s\",\"bytes\":%d,\"error\":\"%s\"}",
+             id, ok ? "true" : "false", ok ? name : "", ok ? (int)strlen(text) : 0, err);
+    send_line(s, resp);
+    free(text);
+}
+
+static void handle_editor_get(sock_t s, const char *id, const char *line) {
+    char name[80] = {0};
+    FILE *f = NULL;
+    unsigned char *raw = NULL;
+    char *esc = NULL, *resp = NULL;
+    size_t n = 0;
+    if (!extract_str(line, "name", name, sizeof(name))) editor_default_name(name, sizeof(name));
+    if (editor_name_ok(name) && (f = fopen(name, "rb")) != NULL) {
+        raw = (unsigned char *)malloc(EDITOR_TEXT_MAX + 1);
+        if (raw) { n = fread(raw, 1, EDITOR_TEXT_MAX, f); }
+        fclose(f);
+    }
+    if (raw) {
+        esc = (char *)malloc(n * 6 + 8);
+        resp = (char *)malloc(n * 6 + 300);
+    }
+    if (raw && esc && resp) {
+        json_escape_bytes(raw, n, esc, n * 6 + 8);
+        snprintf(resp, n * 6 + 300, "{\"id\":\"%s\",\"type\":\"editor_get_result\",\"ok\":true,\"name\":\"%s\",\"text\":\"%s\"}", id, name, esc);
+        send_line(s, resp);
+    } else {
+        char e[300];
+        snprintf(e, sizeof(e), "{\"id\":\"%s\",\"type\":\"editor_get_result\",\"ok\":false,\"error\":\"file not found or bad name\"}", id);
+        send_line(s, e);
+    }
+    free(raw); free(esc); free(resp);
+}
+
 /* probe_report -- run the USB/COM probe and write its JSON into out (card #493). */
 static int probe_report(char *out, size_t outlen) {
     UsbDev devs[USB_PROBE_MAX];
@@ -431,6 +509,10 @@ int main(int argc, char **argv) {
                     handle_serial_open(s, id, line);
                 } else if (strcmp(type, "serial_write") == 0 && id[0] != '\0') {
                     handle_serial_write(s, id, line);
+                } else if (strcmp(type, "editor_set") == 0 && id[0] != '\0') {
+                    handle_editor_set(s, id, line);
+                } else if (strcmp(type, "editor_get") == 0 && id[0] != '\0') {
+                    handle_editor_get(s, id, line);
                 } else if (strcmp(type, "flash_hex") == 0 && id[0] != '\0') {
                     handle_flash_hex(s, id, line);
                 } else if (strcmp(type, "serial_close") == 0 && id[0] != '\0') {

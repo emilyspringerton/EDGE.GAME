@@ -2,11 +2,13 @@
  * Speaks the same encrypted transport as edge_client (common/sec_transport.h), so it works from the
  * founder's Windows PC, the Pi (`boot_announce.sh` pushes its boot event with it), and the e2e test.
  *
- *   edge_ctl <host> <port> <token> [--pin HEX] [--wait SECS] [--follow SECS] [--stdin] [json-line ...]
+ *   edge_ctl <host> <port> <token> [--pin HEX] [--wait SECS] [--follow SECS] [--stdin] [--until-id ID] [json-line ...]
  *
  * Handshake + hello are done for you; each json-line argument is sent as one NDJSON line; every line
  * the relay sends back is printed to stdout, one per line. Output stops after --wait seconds of
  * silence (default 1.5) or, with --follow, after that many seconds in total (for live event streams).
+ * --until-id ID: stop as soon as a reply line carrying "id":"ID" has been printed (instead of waiting
+ * out the silence timer) -- use with a long --wait for slow commands like flash_hex.
  * --stdin (POSIX only): also send every line read from stdin, interactively, until --follow expires --
  * this is how scripts and Claude hold one live session open.
  * Exit code: 0 ok, 1 usage/connect, 2 handshake rejected (pin/TOFU), 3 hello refused.
@@ -46,13 +48,16 @@ static int send_json(const char *json) {
 }
 
 /* Print every complete line in `acc`, keeping any partial tail. Returns number of lines printed. */
+static const char *g_until_needle = NULL; /* set by --until-id */
+static int g_until_hit = 0;
+
 static int print_lines(char *acc, size_t *len) {
     int lines = 0;
     char *start = acc, *nl;
     acc[*len] = '\0';
     while ((nl = strchr(start, '\n')) != NULL) {
         *nl = '\0';
-        if (*start) { printf("%s\n", start); lines++; }
+        if (*start) { printf("%s\n", start); lines++; if (g_until_needle && strstr(start, g_until_needle)) g_until_hit = 1; }
         start = nl + 1;
     }
     *len = strlen(start);
@@ -104,6 +109,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) wait_ms = (int)(atof(argv[++i]) * 1000);
         else if (strcmp(argv[i], "--follow") == 0 && i + 1 < argc) follow_ms = (int)(atof(argv[++i]) * 1000);
         else if (strcmp(argv[i], "--stdin") == 0) use_stdin = 1;
+        else if (strcmp(argv[i], "--until-id") == 0 && i + 1 < argc) {
+            static char needle[128];
+            snprintf(needle, sizeof(needle), "\"id\":\"%s\"", argv[++i]);
+            g_until_needle = needle;
+        }
         else { first_json = i; break; }
     }
 #ifdef _WIN32
@@ -186,6 +196,7 @@ int main(int argc, char **argv) {
             long r = read_some(acc, &acclen, sizeof(acc), wait_ms);
             if (r <= 0) break;
             print_lines(acc, &acclen);
+            if (g_until_hit) break;
         }
     }
     CLOSESOCK(s);
