@@ -1,0 +1,10 @@
+[Unit]
+Description=EDGE.GAME Pi serial responder (answers the Feather bridge)
+After=multi-user.target
+
+[Service]
+ExecStart=/opt/edge/pi/serial_responder.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
