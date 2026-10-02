@@ -249,6 +249,7 @@ long sec_next(SecConn *c, unsigned char *out, size_t cap) {
         result = 0;
     } else {
         Bytes wire = mk(&a, c->raw + 4, len);
+        if (c->recv_ctr >= SEC_REKEY_AT) goto done; /* counter exhausted: drop, peer reconnects */
         Bytes plain = sc_frame_open(mk(&a, c->recv_key, 32), c->is_server ? 1 : 2, c->recv_ctr, wire, &a);
         if (plain.len <= 0 || (size_t)plain.len > cap) goto done;
         memcpy(out, plain.data, (size_t)plain.len);
@@ -264,7 +265,7 @@ done:
 
 int sec_send(SecConn *c, const void *data, size_t n) {
     const unsigned char *p = (const unsigned char *)data;
-    if (!c->established) return -1;
+    if (!c->established || c->send_ctr >= SEC_REKEY_AT) return -1;
     while (n > 0) {
         size_t chunk = n > SEC_MAX_PLAIN ? SEC_MAX_PLAIN : n;
         Arena a;

@@ -16,6 +16,7 @@
 #define SEC_MAX_PLAIN 60000
 #define SEC_RAW_MAX 65536
 #define SEC_PIN_BYTES 32
+#define SEC_REKEY_AT 2147483600 /* frame counters are 32-bit: refuse past this so the peer must re-handshake (new keys) */
 
 typedef struct {
     int fd;

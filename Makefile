@@ -58,7 +58,7 @@ build/libvendor_win.a: $(wildcard vendor/mlkem/*.c) vendor/aead/monocypher.c | b
 		$(CC_WIN) -std=c99 -O2 -w -I ../../vendor/mlkem -c $(addprefix ../../,$(wildcard vendor/mlkem/*.c)) ../../vendor/aead/monocypher.c
 	x86_64-w64-mingw32-ar rcs $@ build/vobjw/*.o
 
-.PHONY: test-avr109 regen-sc test-usb-probe client edge-ctl client-windows relay run-relay test-e2e clean
+.PHONY: test-sec-transport test-avr109 regen-sc test-usb-probe client edge-ctl client-windows relay run-relay test-e2e clean
 
 build:
 	mkdir -p build
@@ -96,6 +96,13 @@ test-usb-probe: build
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -D_POSIX_C_SOURCE=200809L -Iclient \
 		tests/test_usb_probe.c client/usb_probe.c -o build/test_usb_probe
 	./build/test_usb_probe
+
+# test-sec-transport -- common/sec_transport.c over a socketpair (no relay), ASan+UBSan.
+test-sec-transport: build build/libvendor.a
+	$(CC) -std=gnu99 -Wall -Wextra -fsanitize=address,undefined $(SEC_INC) $(SEC_DEFS) \
+		tests/test_sec_transport.c common/sec_transport.c client/runtime/parena_runtime.c build/libvendor.a \
+		-o build/test_sec_transport -lm
+	./build/test_sec_transport
 
 # test-avr109 -- Intel HEX parser + AVR109/Caterina flasher against a protocol simulator on a pty.
 test-avr109: build

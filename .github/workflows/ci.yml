@@ -86,6 +86,8 @@ jobs:
       - name: Build relay
         run: |
           PARENA_ROOT="$PWD/PARENA" LLVM_TOOLCHAIN_ROOT=/ make relay
+      - name: Unit tests (usb probe, secure transport, AVR109 flasher)
+        run: make test-usb-probe test-sec-transport test-avr109
       - name: Run make test-e2e
         run: |
           AVR_TOOLCHAIN_ROOT=/ PARENA_ROOT="$PWD/PARENA" LLVM_TOOLCHAIN_ROOT=/ make test-e2e

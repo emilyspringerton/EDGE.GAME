@@ -54,6 +54,20 @@ in its own frame, never mixed with attacker-controlled text); per-direction fram
 (re-handshake before 2^31 frames -- not enforced yet); the server key is not rotated automatically;
 the Windows/mingw `edge_client.exe`/`edge_ctl.exe` build and link but have not been run on Windows.
 
+**The Claude loop (cards #474/#475/#477/#492 -- built, simulator-verified, NOT hardware-tested):** with the cabinet client
+running on the Windows PC and connected to the relay, the operator side (`edge_ctl`, or `scripts/edge_flash.sh`) can:
+`usb_probe` (find the Feather), `serial_open` (`"port":"auto"`) / `serial_write` / `serial_close` and read everything the
+Feather or Pi prints via `log_since` / `log_subscribe` (no more pasting terminal output), `editor_set` / `editor_get` (the
+EDITOR.GAME window reloads the file live when its buffer is clean), and `flash_hex` -- the SERVER compiles
+(`scripts/compile_prn_feather.sh`: PARENA `.prn` -> C -> avr-gcc -> Intel HEX) and the client flashes the Feather itself
+(1200-baud touch, re-probe the Caterina bootloader, AVR109 page writes, read-back verify) so Windows needs no avr-gcc/avrdude.
+`scripts/edge_flash.sh blink.prn` does editor sync + compile + flash in one command. `feather/pi_bridge` is the Feather firmware
+that bridges USB serial to the Pi's UART with `!ping` / `!pi?`; `pi/serial_responder.sh` answers on the Pi.
+Verification here: `make test-e2e` drives all of it through the relay against a pty (serial) and an AVR109 bootloader
+simulator (`tests/avr109_sim.py`); `make test-avr109`, `test-sec-transport`, `test-usb-probe` are the unit layers.
+**Not verified on real hardware:** Win32 serial + registry probe (mingw-compiled only), the AVR109 flasher against a real
+Caterina bootloader, the Feather firmware (arduino-cli-compiled only), the Pi side. Feather<->Android OTG (#478) is not built.
+
 **USB/COM probe (card #493):** `edge_client probe` (or the relay's `usb_probe` operator command)
 finds the Feather 32u4 by USB VID/PID, reports its COM port and whether it is running a sketch
 (`239A:800C`) or in the Caterina bootloader (`239A:000C`), also classifies Nano (CH340/FTDI) and Pi
