@@ -30,14 +30,14 @@ LLVM_LIB_PATH := $(LLVM_TOOLCHAIN_ROOT)/usr/lib/x86_64-linux-gnu:$(LLVM_TOOLCHAI
 
 CC_WIN ?= x86_64-w64-mingw32-gcc
 
-.PHONY: client client-windows relay run-relay test-e2e clean
+.PHONY: test-usb-probe client client-windows relay run-relay test-e2e clean
 
 build:
 	mkdir -p build
 
 client: build
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -I client/runtime \
-		client/edge_client.c client/runtime/parena_runtime.c -o build/edge_client -lm
+		client/edge_client.c client/usb_probe.c client/runtime/parena_runtime.c -o build/edge_client -lm
 
 # client-windows -- real mingw cross-compile of the same edge_client.c (CI auto-release, S584
 # cont. 3, founder real-time: "get CICD auto releases set up for the game client"). edge_client.c
@@ -52,7 +52,13 @@ client: build
 # unused") -- this is a narrow, CI-only carve-out, not a repo-wide convention change.
 client-windows: build
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS -I client/runtime \
-		client/edge_client.c client/runtime/parena_runtime.c -o build/edge_client.exe -lws2_32 -lm
+		client/edge_client.c client/usb_probe.c client/runtime/parena_runtime.c -o build/edge_client.exe -lws2_32 -ladvapi32 -lm
+
+# test-usb-probe -- classification, JSON, and POSIX enumeration against a fake sysfs tree.
+test-usb-probe: build
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -D_POSIX_C_SOURCE=200809L -Iclient \
+		tests/test_usb_probe.c client/usb_probe.c -o build/test_usb_probe
+	./build/test_usb_probe
 
 # relay -- the real, native PARENA+C server binary. Regenerates both .ll files from their real
 # .prn sources every time (cheap, and keeps the checked-in vendored copies honest), lowers each to

@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "usb_probe.h"
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -58,7 +60,7 @@ static sock_t connect_to(const char *host, int port) {
 }
 
 static int send_line(sock_t s, const char *json) {
-    char buf[4096];
+    char buf[16384];
     int n = snprintf(buf, sizeof(buf), "%s\n", json);
     if (n < 0 || (size_t)n >= sizeof(buf)) return 0;
     return send(s, buf, n, 0) == n;
@@ -105,7 +107,20 @@ static const char *route_target_name(RouteTarget t) {
     return "Unknown";
 }
 
+/* probe_report -- run the USB/COM probe and write its JSON into out (card #493). */
+static int probe_report(char *out, size_t outlen) {
+    UsbDev devs[USB_PROBE_MAX];
+    int n = usb_probe_enumerate(devs, USB_PROBE_MAX, "/sys");
+    return usb_probe_json(devs, n, out, outlen);
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "probe") == 0) { /* standalone: edge_client probe */
+        char out[16384];
+        if (probe_report(out, sizeof(out)) < 0) { fprintf(stderr, "probe output too large\n"); return 1; }
+        printf("%s\n", out);
+        return 0;
+    }
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
     int port = argc > 2 ? atoi(argv[2]) : 8091;
     const char *token = argc > 3 ? argv[3] : getenv("EDGE_CLIENT_TOKEN");
@@ -151,6 +166,11 @@ int main(int argc, char **argv) {
                     snprintf(resp, sizeof(resp),
                              "{\"id\":\"%s\",\"type\":\"route_result\",\"source\":%d,\"target\":\"%s\"}",
                              id, source, route_target_name(target));
+                    send_line(s, resp);
+                } else if (strcmp(type, "usb_probe") == 0 && id[0] != '\0') {
+                    char pj[12000], resp[12400];
+                    if (probe_report(pj, sizeof(pj)) < 0) snprintf(pj, sizeof(pj), "{\"error\":\"probe output too large\"}");
+                    snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"usb_probe_result\",%s", id, pj + 1);
                     send_line(s, resp);
                 } else if (id[0] != '\0') {
                     char ack[512];

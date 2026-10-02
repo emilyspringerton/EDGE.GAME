@@ -38,6 +38,15 @@ real-verified: a clean `-Wall -Wextra -pedantic -Werror` PE32+ binary, since tha
 written portable against `_WIN32`/winsock2 but this was the first time that path was actually
 exercised), bundles a flat `edge_client_windows.zip` (exe + `PLAY.bat`), and auto-tags/releases on
 every green `main` push — same pattern `DEADWEIGHT_2/.github/workflows/ci.yml` already proves live.
+**USB/COM probe (card #493):** `edge_client probe` (or the relay's `usb_probe` operator command)
+finds the Feather 32u4 by USB VID/PID, reports its COM port and whether it is running a sketch
+(`239A:800C`) or in the Caterina bootloader (`239A:000C`), also classifies Nano (CH340/FTDI) and Pi
+gadget devices, and gives a plain-language hint when nothing is found (e.g. charge-only cable).
+Windows backend reads the registry (`advapi32` only); classification, JSON and the POSIX backend are
+unit-tested (`make test-usb-probe`, 16 checks) and the command round-trips in `make test-e2e`.
+**Untested:** the Windows registry backend has been compiled by mingw but never run on a real
+Windows machine yet -- the first `edge_client.exe probe` on the founder's PC is the real test.
+
 Honest scope note: `edge_client.c` is still Phase 1's headless NDJSON test client, not the real
 SDL2 game window (that's still Phase 2+, see `NORTHSTAR.md`) — so the Windows zip has no
 `SDL2.dll` yet, because nothing links it. Because this repo has no GitHub remote yet, the workflow

@@ -94,6 +94,14 @@ send(op, {"id": "c4", "type": "ping", "payload": {}})
 ack = json.loads(recv_line(op))
 check("unrelated command type gets a generic ack", "ack", ack.get("type"))
 
+# usb_probe (card #493): the operator asks the cabinet client to probe its host's USB/COM ports.
+# This sandbox has no USB serial devices, so the honest expected result is count 0 + feather null
+# + the data-cable hint; the point is the command round-trips through relay -> client -> relay.
+send(op, {"id": "c5", "type": "usb_probe", "payload": {}})
+pr = json.loads(recv_line(op))
+check("usb_probe round-trips with a result type", "usb_probe_result", pr.get("type"))
+check("usb_probe result carries a devices list + feather field", True, isinstance(pr.get("devices"), list) and "feather" in pr)
+
 # Wrong operator token: the connection should be closed (no hello_ok), not silently accepted.
 bad = connect()
 send(bad, {"type": "hello", "token": "wrong-token"})
