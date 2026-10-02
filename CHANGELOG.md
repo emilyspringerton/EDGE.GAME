@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2026-10-02
+- feather/pi_bridge firmware (USB<->UART bridge, !ping/!pi?) compiled with arduino-cli + Pi serial responder; not hardware-tested (#474) (sess-20260923-1030-4a526255)
 - serial/terminal capture: client serial_open/write/close (auto-find Feather), relay log buffer + log_since/log_subscribe so Claude reads device output (#492,#474) (sess-20260923-1030-4a526255)
 - encrypted transport on every socket: ML-KEM-768 + LZ4 + XChaCha20-Poly1305 (PARENA secure_channel), edge_ctl CLI, pinned/TOFU fingerprint, handshake reaper, Windows build (#491) (sess-20260923-1030-4a526255)
 
