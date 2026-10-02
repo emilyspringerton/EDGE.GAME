@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2026-10-02
+- sec_transport: frame-counter exhaustion refuses/drops (re-handshake), socketpair unit test under ASan+UBSan, CI unit-test step, README for the Claude loop (sess-20260923-1030-4a526255)
 - editor_set/editor_get commands, scripts/edge_flash.sh + compile_prn_feather.sh: Claude updates the editor file, compiles on the server, flashes the Feather via the relay (#475,#477); simulator-verified (sess-20260923-1030-4a526255)
 - flash_hex: client-side AVR109/Caterina flasher + Intel HEX parser; server compiles, client flashes; simulator-tested, hardware-untested (#477,#474) (sess-20260923-1030-4a526255)
 - feather/pi_bridge firmware (USB<->UART bridge, !ping/!pi?) compiled with arduino-cli + Pi serial responder; not hardware-tested (#474) (sess-20260923-1030-4a526255)
