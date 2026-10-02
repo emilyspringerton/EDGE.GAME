@@ -56,7 +56,7 @@ export EDGE_SERVER_PIN="$PIN"
 CLIENT_PID=$!
 sleep 0.5
 
-BIN="$BIN" PIN="$PIN" EDGE_OPERATOR_PORT="$EDGE_OPERATOR_PORT" EDGE_OPERATOR_TOKEN="$EDGE_OPERATOR_TOKEN" \
+TESTS_DIR="$OLDPWD/tests" REPO_DIR="$OLDPWD" BIN="$BIN" PIN="$PIN" EDGE_OPERATOR_PORT="$EDGE_OPERATOR_PORT" EDGE_OPERATOR_TOKEN="$EDGE_OPERATOR_TOKEN" \
 EDGE_PI_TOKEN="$EDGE_PI_TOKEN" EDGE_CLIENT_PORT="$EDGE_CLIENT_PORT" python3 - <<'PYEOF'
 import json, os, select, socket, subprocess, sys, time
 
@@ -239,6 +239,43 @@ check("the bytes really arrive on the Feather side of the port", b"ping\n", got)
 op.send({"id": "s3", "type": "serial_close", "payload": {}})
 check("serial_close acknowledged", True, json.loads(op.recv()).get("ok") is True)
 sub2.close()
+
+# ---- flash_hex (cards #477/#474): server-compiled hex flashed by the client over AVR109 ----
+sys.path.insert(0, os.environ["TESTS_DIR"])
+from avr109_sim import Sim
+hexpath = os.environ["REPO_DIR"] + "/feather/pi_bridge/pi_bridge.hex"
+hex_text = open(hexpath).read()
+fm, fs = pty.openpty(); tty.setraw(fm)
+sim = Sim(fm); sim.start()
+fsub = Conn(os.environ["EDGE_OPERATOR_TOKEN"]); fsub.recv()
+fsub.send({"type": "log_subscribe", "since": 999999}); fsub.recv()
+op.send({"id": "f1", "type": "flash_hex", "payload": {"hex": hex_text, "bootloader_port": os.ttyname(fs)}})
+fr = json.loads(op.recv(30))
+check("flash_hex through the relay reports ok with a plausible image size", (True, True), (fr.get("ok"), 6000 <= fr.get("bytes", 0) <= 28672))
+want = bytearray(b"\xff" * 28672)
+for ln in hex_text.splitlines():
+    b = bytes.fromhex(ln[1:]) if ln.startswith(":") else b""
+    if b and b[3] == 0: want[(b[1] << 8) | b[2]:((b[1] << 8) | b[2]) + b[0]] = b[4:4 + b[0]]
+top = max(((bytes.fromhex(l[1:])[1] << 8) | bytes.fromhex(l[1:])[2]) + bytes.fromhex(l[1:])[0] for l in hex_text.splitlines() if l.startswith(":") and bytes.fromhex(l[1:])[3] == 0)
+time.sleep(0.2)
+check("the simulated Feather's flash now holds exactly the server-compiled image", bytes(want[:top]), bytes(sim.flash[:top]))
+progress = []
+t_end = time.time() + 3
+while time.time() < t_end:
+    ln = fsub.recv(0.3)
+    if not ln: break
+    try: progress.append(json.loads(ln).get("data", ""))
+    except Exception: pass
+check("flash progress streamed as log channel flash (pages + verify + done)", True,
+      any("writing page" in x for x in progress) and any("verifying" in x for x in progress) and any(x.startswith("done") for x in progress))
+sim.stop = True
+op.send({"id": "f2", "type": "flash_hex", "payload": {"hex": ":10000000" + "00" * 16 + "FF\n", "bootloader_port": "/dev/null"}})
+bad = json.loads(op.recv(10))
+check("flash_hex with a corrupt hex fails cleanly (ok:false + reason)", (False, True), (bad.get("ok"), "checksum" in bad.get("error", "")))
+op.send({"id": "f3", "type": "flash_hex", "payload": {"hex": hex_text}})
+nof = json.loads(op.recv(15))
+check("flash_hex with no Feather attached explains what to do", (False, True), (nof.get("ok"), "no Feather" in nof.get("error", "")))
+fsub.close()
 
 for c in (op, device, sub): c.close()
 sys.exit(1 if fail[0] else 0)

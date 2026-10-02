@@ -31,6 +31,7 @@
 
 #include "usb_probe.h"
 #include "serial_port.h"
+#include "avr109.h"
 #include "../common/sec_transport.h"
 
 #ifdef _WIN32
@@ -143,7 +144,11 @@ static void json_escape_bytes(const unsigned char *in, size_t n, char *out, size
 }
 
 /* extract_str_unescaped -- like extract_str but understands \" \\ \n \r \t \uXXXX (<= 0xFF). */
+static int extract_str_unescaped_n(const char *json, const char *field, char *out, size_t outlen);
 static int extract_str_unescaped(const char *json, const char *field, char *out, size_t outlen) {
+    return extract_str_unescaped_n(json, field, out, outlen);
+}
+static int extract_str_unescaped_n(const char *json, const char *field, char *out, size_t outlen) {
     char needle[64];
     const char *p;
     size_t o = 0;
@@ -246,6 +251,90 @@ static void handle_serial_write(sock_t s, const char *id, const char *line) {
     send_line(s, resp);
 }
 
+
+/* ---- flash_hex (cards #477/#474) ----------------------------------------------------------------
+ * The SERVER compiles; this client only flashes. Payload {"hex":"<Intel HEX, JSON-escaped>"} and
+ * optionally "bootloader_port" (flash that port directly, skipping the reset dance -- also the manual
+ * override if the USB probe can't see the bootloader). Otherwise: 1200-baud touch on the Feather's
+ * app port (closing any open capture first) -> wait for the Caterina bootloader to enumerate (239A:000C,
+ * port number may CHANGE on Windows, so it is re-probed) -> AVR109 flash + verify -> wait for the sketch
+ * to re-enumerate (239A:800C) and reopen the capture port. Progress streams as log channel "flash". */
+static void flash_progress(void *user, const char *msg) { emit_log(*(sock_t *)user, "flash", (const unsigned char *)msg, strlen(msg)); }
+
+static int find_port(UsbRole want, char *out, size_t cap) {
+    UsbDev devs[USB_PROBE_MAX];
+    int n = usb_probe_enumerate(devs, USB_PROBE_MAX, "/sys"), i;
+    for (i = 0; i < n; i++) if (devs[i].role == want) { snprintf(out, cap, "%s", devs[i].port); return 1; }
+    return 0;
+}
+
+static int wait_port(UsbRole want, char *out, size_t cap, int timeout_ms) {
+    int waited = 0;
+    while (!find_port(want, out, cap)) {
+        if (waited >= timeout_ms) return 0;
+#ifdef _WIN32
+        Sleep(250);
+#else
+        usleep(250000);
+#endif
+        waited += 250;
+    }
+    return 1;
+}
+
+static void handle_flash_hex(sock_t s, const char *id, const char *line) {
+    static unsigned char image[AVR_FLASH_MAX];
+    char err[300] = "", bport[64] = "", app_port[64] = "", resp[700], e2[600];
+    size_t hexcap = 262144;
+    char *hex = (char *)malloc(hexcap);
+    int len = -1, ok = 0, reopen_baud = 115200, was_open = g_sp != NULL;
+    if (!hex) return;
+    extract_str_unescaped_n(line, "hex", hex, hexcap);
+    extract_str(line, "bootloader_port", bport, sizeof(bport));
+    len = ihex_parse(hex, image, sizeof(image), err, sizeof(err));
+    free(hex);
+    if (len > 0) {
+        SerialPort *bp = NULL;
+        if (!bport[0]) {
+            char port[64];
+            if (find_port(USB_ROLE_FEATHER_BOOTLOADER, bport, sizeof(bport))) { /* already in the bootloader */ }
+            else {
+                if (g_sp) { snprintf(port, sizeof(port), "%s", g_sp_name); serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }
+                else if (!find_port(USB_ROLE_FEATHER_APP, port, sizeof(port))) { snprintf(err, sizeof(err), "no Feather found: run usb_probe (replug it, or double-tap RESET and pass bootloader_port)"); len = -1; }
+                if (len > 0) {
+                    SerialPort *t = serial_open(port, 1200, err, sizeof(err)); /* the 1200-baud touch */
+                    if (!t) len = -1; else { serial_close(t); flash_progress(&s, "1200-baud touch sent, waiting for the bootloader"); }
+                }
+                if (len > 0 && !wait_port(USB_ROLE_FEATHER_BOOTLOADER, bport, sizeof(bport), 10000)) {
+                    snprintf(err, sizeof(err), "the Feather did not re-enumerate as the Caterina bootloader within 10s");
+                    len = -1;
+                }
+            }
+        }
+        if (len > 0) {
+            bp = serial_open(bport, 57600, err, sizeof(err));
+            if (!bp) len = -1;
+            else {
+                ok = avr109_flash(bp, image, len, flash_progress, &s, err, sizeof(err)) == 0;
+                serial_close(bp);
+            }
+        }
+    }
+    if (ok) {
+        flash_progress(&s, "waiting for the sketch to enumerate");
+        if (wait_port(USB_ROLE_FEATHER_APP, app_port, sizeof(app_port), 10000) && was_open) {
+            char e3[100];
+            g_sp = serial_open(app_port, reopen_baud, e3, sizeof(e3));
+            if (g_sp) snprintf(g_sp_name, sizeof(g_sp_name), "%s", app_port);
+        }
+        snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"flash_result\",\"ok\":true,\"bytes\":%d,\"app_port\":\"%s\"}", id, len, app_port);
+    } else {
+        json_escape_bytes((const unsigned char *)err, strlen(err), e2, sizeof(e2));
+        snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"flash_result\",\"ok\":false,\"error\":\"%s\"}", id, e2);
+    }
+    send_line(s, resp);
+}
+
 /* probe_report -- run the USB/COM probe and write its JSON into out (card #493). */
 static int probe_report(char *out, size_t outlen) {
     UsbDev devs[USB_PROBE_MAX];
@@ -342,6 +431,8 @@ int main(int argc, char **argv) {
                     handle_serial_open(s, id, line);
                 } else if (strcmp(type, "serial_write") == 0 && id[0] != '\0') {
                     handle_serial_write(s, id, line);
+                } else if (strcmp(type, "flash_hex") == 0 && id[0] != '\0') {
+                    handle_flash_hex(s, id, line);
                 } else if (strcmp(type, "serial_close") == 0 && id[0] != '\0') {
                     char resp[200];
                     if (g_sp) { serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }

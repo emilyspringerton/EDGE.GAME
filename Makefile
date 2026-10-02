@@ -58,14 +58,14 @@ build/libvendor_win.a: $(wildcard vendor/mlkem/*.c) vendor/aead/monocypher.c | b
 		$(CC_WIN) -std=c99 -O2 -w -I ../../vendor/mlkem -c $(addprefix ../../,$(wildcard vendor/mlkem/*.c)) ../../vendor/aead/monocypher.c
 	x86_64-w64-mingw32-ar rcs $@ build/vobjw/*.o
 
-.PHONY: regen-sc test-usb-probe client edge-ctl client-windows relay run-relay test-e2e clean
+.PHONY: test-avr109 regen-sc test-usb-probe client edge-ctl client-windows relay run-relay test-e2e clean
 
 build:
 	mkdir -p build
 
 client: build build/libvendor.a
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) \
-		client/edge_client.c client/usb_probe.c client/serial_port.c $(SEC_SRCS) build/libvendor.a -o build/edge_client -lm
+		client/edge_client.c client/usb_probe.c client/serial_port.c client/avr109.c $(SEC_SRCS) build/libvendor.a -o build/edge_client -lm
 
 # edge-ctl -- the operator/device command-line tool (also what the Pi's boot announce and test-e2e use).
 edge-ctl: build build/libvendor.a
@@ -85,7 +85,7 @@ edge-ctl: build build/libvendor.a
 # unused") -- this is a narrow, CI-only carve-out, not a repo-wide convention change.
 client-windows: build build/libvendor_win.a
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
-		client/edge_client.c client/usb_probe.c client/serial_port.c $(SEC_SRCS) build/libvendor_win.a \
+		client/edge_client.c client/usb_probe.c client/serial_port.c client/avr109.c $(SEC_SRCS) build/libvendor_win.a \
 		-o build/edge_client.exe -lws2_32 -ladvapi32 -lm
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
 		client/edge_ctl.c $(SEC_SRCS) build/libvendor_win.a \
@@ -96,6 +96,12 @@ test-usb-probe: build
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -D_POSIX_C_SOURCE=200809L -Iclient \
 		tests/test_usb_probe.c client/usb_probe.c -o build/test_usb_probe
 	./build/test_usb_probe
+
+# test-avr109 -- Intel HEX parser + AVR109/Caterina flasher against a protocol simulator on a pty.
+test-avr109: build
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror tests/avr109_flash_cli.c client/avr109.c client/serial_port.c \
+		-o build/avr109_flash_cli
+	python3 tests/test_avr109.py build/avr109_flash_cli feather/pi_bridge/pi_bridge.hex
 
 # relay -- the real, native PARENA+C server binary. Regenerates both .ll files from their real
 # .prn sources every time (cheap, and keeps the checked-in vendored copies honest), lowers each to

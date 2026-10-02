@@ -387,7 +387,9 @@ static void handle_operator_line(int slot, const char *line) {
     }
     snprintf(g_pending[pslot].id, sizeof(g_pending[pslot].id), "%s", id);
     g_pending[pslot].operator_slot = slot;
-    g_pending[pslot].deadline = time(NULL) + g_command_timeout_s;
+    /* flashing (1200-baud touch + re-enumeration + 48 page writes + verify) legitimately takes far
+       longer than a ping; give it 90s instead of the default */
+    g_pending[pslot].deadline = time(NULL) + (strcmp(type, "flash_hex") == 0 ? 90 : g_command_timeout_s);
     g_pending[pslot].used = 1;
     send_line(g_cabinet_fd, line);
 }
