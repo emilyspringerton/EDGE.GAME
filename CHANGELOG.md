@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-02
+
+- client: USB/COM probe (edge_client probe / usb_probe command) finds the Feather 32u4 by VID/PID on Windows; make test-usb-probe (#493) (sess-20260923-1030-4a526255)
+
+
 ## 2026-09-29
 
 - feat(ci): `.github/workflows/ci.yml` — auto-release pipeline for the game client, ported from
