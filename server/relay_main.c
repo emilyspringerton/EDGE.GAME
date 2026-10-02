@@ -107,6 +107,8 @@ typedef struct {
     int in_use;
     int authed;
     int is_subscriber;
+    int log_sub;      /* live log/serial stream subscriber */
+    long log_cursor;  /* next log seq this subscriber hasn't been sent */
     int sub_cursor; /* next REFLUX index (0-based, log-relative) this subscriber hasn't seen yet */
     char buf[LINEBUF_SIZE];
     size_t buflen;
@@ -190,6 +192,84 @@ static void handle_device_event(const char *line) {
        protocol violation worth tearing down the connection over. */
 }
 
+
+/* ---- cabinet log buffer (cards #492/#474) --------------------------------------------------------
+ * The cabinet client pushes {"type":"log","channel":"serial|client|term","data":"<json-escaped>"}
+ * (the Feather's serial lines, client diagnostics, terminal output). The relay keeps the last
+ * LOG_RING of them with a stable 1-based seq and streams them to subscribers, so an operator (Claude)
+ * can read device output directly. `data` is stored and re-emitted RAW (still JSON-escaped): the relay
+ * never needs the decoded text, and that keeps arbitrary serial bytes safe. Buffer is in-memory only. */
+#define LOG_RING 512
+#define LOG_DATA_MAX 1100
+typedef struct { long seq; char channel[16]; char data[LOG_DATA_MAX]; } LogEntry;
+static LogEntry g_logs[LOG_RING];
+static long g_log_total = 0;
+
+/* raw copy of a JSON string value (escapes preserved) */
+static int extract_str_raw(const char *json, const char *field, char *out, size_t outlen) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", field);
+    const char *p = strstr(json, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    size_t i = 0;
+    while (*p && *p != '"' && i + 2 < outlen) {
+        if (*p == '\\' && p[1]) out[i++] = *p++;
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return 1;
+}
+
+static void send_log_entry(int fd, const LogEntry *e, const char *type) {
+    static char line[LOG_DATA_MAX + 128];
+    snprintf(line, sizeof(line), "{\"type\":\"%s\",\"seq\":%ld,\"channel\":\"%s\",\"data\":\"%s\"}", type, e->seq, e->channel, e->data);
+    send_line(fd, line);
+}
+
+static void handle_cabinet_log(const char *line) {
+    LogEntry *e = &g_logs[g_log_total % LOG_RING];
+    memset(e, 0, sizeof(*e));
+    extract_str(line, "channel", e->channel, sizeof(e->channel));
+    if (!e->channel[0]) snprintf(e->channel, sizeof(e->channel), "serial");
+    extract_str_raw(line, "data", e->data, sizeof(e->data));
+    e->seq = ++g_log_total;
+    for (int i = 0; i < MAX_OPERATORS; i++) {
+        OperatorConn *op = &g_operators[i];
+        if (!op->in_use || !op->log_sub) continue;
+        for (long q = op->log_cursor; q <= g_log_total; q++) {
+            LogEntry *x = &g_logs[(q - 1) % LOG_RING];
+            if (x->seq == q) send_log_entry(op->fd, x, "log");
+        }
+        op->log_cursor = g_log_total + 1;
+    }
+}
+
+/* log_since / log_subscribe: oldest-first replay of retained entries with seq > since (optional
+   "channel" filter), as one {"type":"logs","items":[...],"next":N} reply. */
+static void handle_log_since(OperatorConn *op, const char *line) {
+    static char out[60000];
+    long since = 0;
+    int sn = 0;
+    char chan[16] = {0};
+    if (extract_int(line, "since", &sn)) since = sn;
+    extract_str(line, "channel", chan, sizeof(chan));
+    size_t off = (size_t)snprintf(out, sizeof(out), "{\"type\":\"logs\",\"items\":[");
+    int first = 1;
+    long oldest = g_log_total > LOG_RING ? g_log_total - LOG_RING + 1 : 1;
+    for (long q = (since + 1 > oldest ? since + 1 : oldest); q <= g_log_total; q++) {
+        LogEntry *x = &g_logs[(q - 1) % LOG_RING];
+        if (chan[0] && strcmp(chan, x->channel) != 0) continue;
+        char item[LOG_DATA_MAX + 96];
+        int n = snprintf(item, sizeof(item), "%s{\"seq\":%ld,\"channel\":\"%s\",\"data\":\"%s\"}", first ? "" : ",", x->seq, x->channel, x->data);
+        if (n < 0 || off + (size_t)n + 40 >= sizeof(out)) break; /* reply is bounded; caller re-asks with the returned next */
+        memcpy(out + off, item, (size_t)n); off += (size_t)n; first = 0;
+        since = q;
+    }
+    snprintf(out + off, sizeof(out) - off, "],\"next\":%ld}", since > 0 ? since : 0);
+    send_line(op->fd, out);
+}
+
 static void handle_events_since(OperatorConn *op, const char *line) {
     int since = 0;
     extract_int(line, "since", &since);
@@ -264,6 +344,19 @@ static void handle_operator_line(int slot, const char *line) {
         handle_events_since(op, line);
         return;
     }
+    if (strcmp(type, "log_since") == 0) {
+        handle_log_since(op, line);
+        return;
+    }
+    if (strcmp(type, "log_subscribe") == 0) {
+        int sn = 0;
+        extract_int(line, "since", &sn);
+        handle_log_since(op, line); /* catch-up first, then live */
+        op->log_sub = 1;
+        op->log_cursor = g_log_total + 1;
+        (void)sn;
+        return;
+    }
     if (strcmp(type, "events_subscribe") == 0) {
         op->is_subscriber = 1;
         handle_events_since(op, line); /* real, immediate catch-up flush before switching to live push */
@@ -313,6 +406,11 @@ static void handle_cabinet_line(const char *line) {
             g_cabinet_fd = -1;
         }
         return;
+    }
+    {
+        char t[32] = {0};
+        extract_str(line, "type", t, sizeof(t));
+        if (strcmp(t, "log") == 0) { handle_cabinet_log(line); return; }
     }
     char id[64] = {0};
     extract_str(line, "id", id, sizeof(id));

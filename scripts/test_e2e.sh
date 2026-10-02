@@ -198,6 +198,48 @@ live = json.loads(sub.recv())
 check("live subscriber receives the second boot event without polling", "event", live.get("type"))
 check("live push carries the real pi_id", 2, live.get("a"))
 
+# ---- serial / terminal capture (cards #492/#474): a pty stands in for the Feather's COM port ----
+import pty, tty
+master, slave = pty.openpty()
+tty.setraw(master)
+slave_name = os.ttyname(slave)
+op.send({"id": "s0", "type": "serial_open", "payload": {"port": "/dev/does-not-exist"}})
+bad_open = json.loads(op.recv())
+check("serial_open on a missing port reports ok:false with a reason", True, bad_open.get("ok") is False and "error" in bad_open)
+op.send({"id": "s1", "type": "serial_open", "payload": {"port": slave_name, "baud": 115200}})
+opened = json.loads(op.recv())
+check("serial_open on the pty succeeds", True, opened.get("ok") is True)
+
+os.write(master, b'hello feather\r\nsay "quoted" and tab\there\npartial prompt> ')
+time.sleep(0.6)
+op.send({"type": "log_since", "since": 0, "channel": "serial"})
+logs = json.loads(op.recv())
+texts = [i["data"] for i in logs.get("items", [])]
+check("log_since returns the Feather's lines in order (CRLF stripped)", "hello feather", texts[0] if texts else None)
+check("quotes and tabs survive the JSON round trip (escaped on the wire)", 'say "quoted" and tab\there', texts[1] if len(texts) > 1 else None)
+check("a partial line (a prompt with no newline) is flushed after a short idle", "partial prompt> ", texts[2] if len(texts) > 2 else None)
+
+sub2 = Conn(os.environ["EDGE_OPERATOR_TOKEN"]); sub2.recv()
+sub2.send({"type": "log_subscribe", "since": 999999}); sub2.recv()
+os.write(master, b"live line\n")
+liveline = json.loads(sub2.recv(5))
+check("log_subscribe streams a new serial line live", "live line", liveline.get("data"))
+check("live log carries a seq and channel", ("serial", True), (liveline.get("channel"), isinstance(liveline.get("seq"), int)))
+
+op.send({"id": "s2", "type": "serial_write", "payload": {"data": "ping", "newline": 1}})
+wr = json.loads(op.recv())
+check("serial_write reports the bytes written", 5, wr.get("bytes"))
+time.sleep(0.2)
+os.set_blocking(master, False)
+try:
+    got = os.read(master, 100)
+except BlockingIOError:
+    got = b""
+check("the bytes really arrive on the Feather side of the port", b"ping\n", got)
+op.send({"id": "s3", "type": "serial_close", "payload": {}})
+check("serial_close acknowledged", True, json.loads(op.recv()).get("ok") is True)
+sub2.close()
+
 for c in (op, device, sub): c.close()
 sys.exit(1 if fail[0] else 0)
 PYEOF

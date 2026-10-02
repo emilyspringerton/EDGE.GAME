@@ -65,7 +65,7 @@ build:
 
 client: build build/libvendor.a
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) \
-		client/edge_client.c client/usb_probe.c $(SEC_SRCS) build/libvendor.a -o build/edge_client -lm
+		client/edge_client.c client/usb_probe.c client/serial_port.c $(SEC_SRCS) build/libvendor.a -o build/edge_client -lm
 
 # edge-ctl -- the operator/device command-line tool (also what the Pi's boot announce and test-e2e use).
 edge-ctl: build build/libvendor.a
@@ -85,7 +85,7 @@ edge-ctl: build build/libvendor.a
 # unused") -- this is a narrow, CI-only carve-out, not a repo-wide convention change.
 client-windows: build build/libvendor_win.a
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
-		client/edge_client.c client/usb_probe.c $(SEC_SRCS) build/libvendor_win.a \
+		client/edge_client.c client/usb_probe.c client/serial_port.c $(SEC_SRCS) build/libvendor_win.a \
 		-o build/edge_client.exe -lws2_32 -ladvapi32 -lm
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
 		client/edge_ctl.c $(SEC_SRCS) build/libvendor_win.a \

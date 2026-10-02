@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "usb_probe.h"
+#include "serial_port.h"
 #include "../common/sec_transport.h"
 
 #ifdef _WIN32
@@ -41,6 +42,7 @@ typedef SOCKET sock_t;
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 #include <unistd.h>
 typedef int sock_t;
 #define CLOSESOCK close
@@ -113,6 +115,137 @@ static const char *route_target_name(RouteTarget t) {
     return "Unknown";
 }
 
+
+/* ---- serial / terminal capture (cards #492/#474) ----------------------------------------------
+ * The operator can open the Feather's COM port ("auto" finds it with the USB probe), write to it, and
+ * read everything it prints: each line arrives at the relay as an unsolicited
+ * {"type":"log","channel":"serial","data":...} the relay buffers and streams -- so Claude reads the
+ * Feather's output directly instead of the founder pasting it. */
+static SerialPort *g_sp = NULL;
+static char g_sp_name[64];
+static char g_sp_line[512];
+static size_t g_sp_len = 0;
+static unsigned long g_sp_idle_polls = 0;
+
+/* json_escape -- escape arbitrary bytes into a JSON string body (control + non-ASCII bytes -> \u00XX). */
+static void json_escape_bytes(const unsigned char *in, size_t n, char *out, size_t cap) {
+    size_t o = 0, i;
+    for (i = 0; i < n && o + 8 < cap; i++) {
+        unsigned char c = in[i];
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20 || c > 0x7e) { o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c); }
+        else out[o++] = (char)c;
+    }
+    out[o] = '\0';
+}
+
+/* extract_str_unescaped -- like extract_str but understands \" \\ \n \r \t \uXXXX (<= 0xFF). */
+static int extract_str_unescaped(const char *json, const char *field, char *out, size_t outlen) {
+    char needle[64];
+    const char *p;
+    size_t o = 0;
+    snprintf(needle, sizeof(needle), "\"%s\":\"", field);
+    p = strstr(json, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p && *p != '"' && o + 1 < outlen) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'n') out[o++] = '\n';
+            else if (*p == 'r') out[o++] = '\r';
+            else if (*p == 't') out[o++] = '\t';
+            else if (*p == 'u' && p[1] && p[2] && p[3] && p[4]) {
+                char hx[5]; memcpy(hx, p + 1, 4); hx[4] = 0;
+                out[o++] = (char)strtol(hx, NULL, 16);
+                p += 4;
+            } else out[o++] = *p;
+            p++;
+        } else out[o++] = *p++;
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+static void emit_log(sock_t s, const char *channel, const unsigned char *data, size_t n) {
+    char esc[1200], line[1400];
+    json_escape_bytes(data, n, esc, sizeof(esc));
+    snprintf(line, sizeof(line), "{\"type\":\"log\",\"channel\":\"%s\",\"data\":\"%s\"}", channel, esc);
+    send_line(s, line);
+}
+
+static void flush_serial_line(sock_t s) {
+    if (g_sp_len > 0) { emit_log(s, "serial", (const unsigned char *)g_sp_line, g_sp_len); g_sp_len = 0; }
+}
+
+/* poll_serial -- called every loop tick: pull available bytes, emit full lines as they complete, and
+ * flush a partial line (a prompt with no newline) after ~200ms of silence. */
+static void poll_serial(sock_t s) {
+    unsigned char chunk[256];
+    int n;
+    if (!g_sp) return;
+    n = serial_read(g_sp, chunk, sizeof(chunk));
+    if (n < 0) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "serial port %s read failed (unplugged?) -- closed", g_sp_name);
+        emit_log(s, "client", (const unsigned char *)msg, strlen(msg));
+        serial_close(g_sp); g_sp = NULL; g_sp_len = 0;
+        return;
+    }
+    if (n == 0) { if (++g_sp_idle_polls >= 4) { flush_serial_line(s); g_sp_idle_polls = 0; } return; }
+    g_sp_idle_polls = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = chunk[i];
+        if (c == '\n') { if (g_sp_len && g_sp_line[g_sp_len - 1] == '\r') g_sp_len--; flush_serial_line(s); }
+        else { g_sp_line[g_sp_len++] = (char)c; if (g_sp_len >= sizeof(g_sp_line) - 1) flush_serial_line(s); }
+    }
+}
+
+static void handle_serial_open(sock_t s, const char *id, const char *line) {
+    char port[64] = {0}, err[200] = "", resp[600];
+    int baud = 115200;
+    UsbDev devs[USB_PROBE_MAX];
+    extract_str(line, "port", port, sizeof(port));
+    extract_int(line, "baud", &baud);
+    if (strcmp(port, "auto") == 0 || port[0] == '\0') {
+        int n = usb_probe_enumerate(devs, USB_PROBE_MAX, "/sys"), i;
+        port[0] = '\0';
+        for (i = 0; i < n && !port[0]; i++)
+            if (devs[i].role == USB_ROLE_FEATHER_APP || devs[i].role == USB_ROLE_FEATHER_BOOTLOADER)
+                snprintf(port, sizeof(port), "%s", devs[i].port);
+        if (!port[0]) snprintf(err, sizeof(err), "auto: no Feather found (run usb_probe for details)");
+    }
+    if (port[0] && !err[0]) {
+        if (g_sp) { serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }
+        g_sp = serial_open(port, baud, err, sizeof(err));
+        if (g_sp) snprintf(g_sp_name, sizeof(g_sp_name), "%s", port);
+    }
+    if (g_sp) snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"serial_open_result\",\"ok\":true,\"port\":\"%s\",\"baud\":%d}", id, port, baud);
+    else {
+        char e2[400];
+        json_escape_bytes((const unsigned char *)err, strlen(err), e2, sizeof(e2));
+        snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"serial_open_result\",\"ok\":false,\"error\":\"%s\"}", id, e2);
+    }
+    send_line(s, resp);
+}
+
+static void handle_serial_write(sock_t s, const char *id, const char *line) {
+    char data[2048] = {0}, resp[300];
+    int nl = 0, w = -1;
+    extract_str_unescaped(line, "data", data, sizeof(data));
+    extract_int(line, "newline", &nl);
+    if (g_sp) {
+        size_t n = strlen(data);
+        if (nl && n + 1 < sizeof(data)) data[n++] = '\n';
+        w = serial_write(g_sp, (const unsigned char *)data, n);
+    }
+    snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"serial_write_result\",\"ok\":%s,\"bytes\":%d%s}", id,
+             w >= 0 ? "true" : "false", w < 0 ? 0 : w, g_sp ? "" : ",\"error\":\"no serial port open (send serial_open first)\"");
+    send_line(s, resp);
+}
+
 /* probe_report -- run the USB/COM probe and write its JSON into out (card #493). */
 static int probe_report(char *out, size_t outlen) {
     UsbDev devs[USB_PROBE_MAX];
@@ -165,7 +298,13 @@ int main(int argc, char **argv) {
         long n = sec_next(&g_sec, plain, sizeof(plain));
         if (n < 0) { fprintf(stderr, "secure channel: authentication/protocol failure\n"); break; }
         if (n == 0) {
-            if (sec_fill(&g_sec) <= 0) { fprintf(stderr, "connection closed\n"); break; }
+            /* idle: wait for socket data, but wake every 50ms while a serial port is open to poll it */
+            fd_set rf; struct timeval tv; int r;
+            FD_ZERO(&rf); FD_SET(s, &rf);
+            tv.tv_sec = g_sp ? 0 : 1; tv.tv_usec = g_sp ? 50000 : 0;
+            r = select((int)s + 1, &rf, NULL, NULL, &tv);
+            if (r > 0 && sec_fill(&g_sec) <= 0) { fprintf(stderr, "connection closed\n"); break; }
+            poll_serial(s);
             continue;
         }
         if (buflen + (size_t)n >= sizeof(buf)) buflen = 0; /* overflow-drop, never overrun */
@@ -198,6 +337,15 @@ int main(int argc, char **argv) {
                     char pj[12000], resp[12400];
                     if (probe_report(pj, sizeof(pj)) < 0) snprintf(pj, sizeof(pj), "{\"error\":\"probe output too large\"}");
                     snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"usb_probe_result\",%s", id, pj + 1);
+                    send_line(s, resp);
+                } else if (strcmp(type, "serial_open") == 0 && id[0] != '\0') {
+                    handle_serial_open(s, id, line);
+                } else if (strcmp(type, "serial_write") == 0 && id[0] != '\0') {
+                    handle_serial_write(s, id, line);
+                } else if (strcmp(type, "serial_close") == 0 && id[0] != '\0') {
+                    char resp[200];
+                    if (g_sp) { serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }
+                    snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"serial_close_result\",\"ok\":true}", id);
                     send_line(s, resp);
                 } else if (id[0] != '\0') {
                     char ack[512];
