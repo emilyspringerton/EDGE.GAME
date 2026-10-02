@@ -147,6 +147,14 @@ not a bigger version of the same Windows-only plan, a second, parallel arm:
   PC during dev, or through a USB-OTG adapter to the Android tablet in production. Whichever host
   is attached owns the serial link; there's no scoped case (yet) for both being attached and
   arbitrating at once.
+  **Relay support shipped (card #478, 2026-10-02):** the relay now holds one cabinet connection *per
+  host* (`hello` carries `"host":"windows"|"android"`, default windows; `EDGE_HOST=android` on the
+  client), each host reports `{"type":"link","feather":0|1}` when it opens/closes the Feather's serial
+  port, and operator commands go to the host holding the link — or an explicit `"host"` field. Both
+  hosts claiming the Feather is reported (`{"type":"hosts"}` → `feather_host:"conflict"`) and an
+  ambiguous command is refused rather than guessed. `make test-e2e` covers it with a pty per host.
+  Not built: the Android client itself (nothing speaks `host:"android"` yet except the test), and
+  Feather-side USB-presence detection (today "has the link" means "its serial port is open").
 - **The Raspberry Pis are a real edge-node layer, not a single companion box.** Founder's own
   words: "like kubernetes with like 2 raspi bs an edge node." Real, honest, NOT yet resolved:
   whether this means literal container orchestration (k3s/k8s across 2 Pis) or an informal way of

@@ -124,12 +124,29 @@ typedef struct {
 static OperatorConn g_operators[MAX_OPERATORS];
 static Pending g_pending[MAX_PENDING];
 
-static int g_cabinet_fd = -1;
-static SecConn g_cabinet_sec;
-static time_t g_cabinet_accepted;
-static int g_cabinet_authed = 0;
-static char g_cabinet_buf[LINEBUF_SIZE];
-static size_t g_cabinet_buflen = 0;
+/* Cabinet hosts (card #478). The Feather's one USB link is on EITHER the Windows dev PC or the Android
+   tablet -- never both at once -- but both hosts may be connected to this relay (the tablet is the
+   production brain, the PC the dev console). Each host holds one authed cabinet connection (a
+   reconnect of the same host replaces the old one); a host reports whether the Feather is currently
+   attached to it with {"type":"link","feather":0|1}. Operator commands go to the host that has the
+   Feather, or to an explicit {"host":"windows|android"}. */
+#define MAX_CABS 4
+#define HOST_WINDOWS 0
+#define HOST_ANDROID 1
+#define HOST_COUNT 2
+static const char *const HOST_NAMES[HOST_COUNT] = { "windows", "android" };
+typedef struct {
+    int in_use;
+    int fd;
+    SecConn sec;
+    time_t accepted;
+    int authed;
+    int host;
+    int feather;
+    char buf[LINEBUF_SIZE];
+    size_t buflen;
+} Cabinet;
+static Cabinet g_cabs[MAX_CABS];
 
 static const char *g_client_token;
 static const char *g_operator_token;
@@ -140,7 +157,8 @@ static int g_command_timeout_s;
    send_line finds the connection for an fd and encrypts. A peer that hasn't finished the handshake
    gets nothing. */
 static SecConn *conn_for_fd(int fd) {
-    if (fd >= 0 && fd == g_cabinet_fd) return &g_cabinet_sec;
+    for (int i = 0; i < MAX_CABS; i++)
+        if (g_cabs[i].in_use && g_cabs[i].fd == fd) return &g_cabs[i].sec;
     for (int i = 0; i < MAX_OPERATORS; i++)
         if (g_operators[i].in_use && g_operators[i].fd == fd) return &g_operators[i].sec;
     return NULL;
@@ -305,10 +323,13 @@ static void handle_events_since(OperatorConn *op, const char *line) {
 static int g_handshake_deadline_s = 10; /* EDGE_HANDSHAKE_DEADLINE_S overrides (tests use 2) */
 static void reap_unauthenticated(void) {
     time_t now = time(NULL);
-    if (g_cabinet_fd >= 0 && !g_cabinet_authed && now - g_cabinet_accepted > g_handshake_deadline_s) {
-        fprintf(stderr, "[relay] dropping cabinet connection that never authenticated\n");
-        close(g_cabinet_fd);
-        g_cabinet_fd = -1;
+    for (int i = 0; i < MAX_CABS; i++) {
+        Cabinet *c = &g_cabs[i];
+        if (c->in_use && !c->authed && now - c->accepted > g_handshake_deadline_s) {
+            fprintf(stderr, "[relay] dropping cabinet connection that never authenticated\n");
+            close(c->fd);
+            c->in_use = 0;
+        }
     }
     for (int i = 0; i < MAX_OPERATORS; i++) {
         OperatorConn *op = &g_operators[i];
@@ -335,11 +356,55 @@ static void find_and_expire_pending(void) {
     }
 }
 
+/* pick_cabinet -- which connected host should receive an operator command? An explicit host name
+   wins; otherwise the single connected host, else the one that reports the Feather. Refuses (with a
+   reason) rather than guessing when it is ambiguous. */
+static Cabinet *pick_cabinet(const char *want_host, const char **err) {
+    Cabinet *authed[MAX_CABS]; int n = 0;
+    for (int i = 0; i < MAX_CABS; i++) if (g_cabs[i].in_use && g_cabs[i].authed) authed[n++] = &g_cabs[i];
+    if (want_host && want_host[0]) {
+        for (int i = 0; i < n; i++) if (strcmp(HOST_NAMES[authed[i]->host], want_host) == 0) return authed[i];
+        *err = "requested host is not connected";
+        return NULL;
+    }
+    if (n == 0) { *err = "no cabinet connected"; return NULL; }
+    if (n == 1) return authed[0];
+    Cabinet *with = NULL; int nf = 0;
+    for (int i = 0; i < n; i++) if (authed[i]->feather) { with = authed[i]; nf++; }
+    if (nf == 1) return with;
+    *err = nf == 0 ? "several hosts connected and none reports the Feather -- pass \\\"host\\\""
+                   : "several hosts claim the Feather (one USB link cannot be on both) -- pass \\\"host\\\"";
+    return NULL;
+}
+
+static void handle_hosts(OperatorConn *op) {
+    char out[512];
+    size_t off = (size_t)snprintf(out, sizeof(out), "{\"type\":\"hosts\",\"items\":[");
+    int first = 1, nf = 0; const char *fh = NULL;
+    for (int h = 0; h < HOST_COUNT; h++) {
+        for (int i = 0; i < MAX_CABS; i++) {
+            Cabinet *c = &g_cabs[i];
+            if (!(c->in_use && c->authed && c->host == h)) continue;
+            off += (size_t)snprintf(out + off, sizeof(out) - off, "%s{\"host\":\"%s\",\"feather\":%s}",
+                                    first ? "" : ",", HOST_NAMES[h], c->feather ? "true" : "false");
+            first = 0;
+            if (c->feather) { nf++; fh = HOST_NAMES[h]; }
+        }
+    }
+    snprintf(out + off, sizeof(out) - off, "],\"feather_host\":%s%s%s}",
+             nf == 1 ? "\"" : "", nf == 1 ? fh : (nf == 0 ? "null" : "\"conflict\""), nf == 1 ? "\"" : "");
+    send_line(op->fd, out);
+}
+
 static void handle_operator_line(int slot, const char *line) {
     OperatorConn *op = &g_operators[slot];
     char type[64] = {0};
     extract_str(line, "type", type, sizeof(type));
 
+    if (strcmp(type, "hosts") == 0) {
+        handle_hosts(op);
+        return;
+    }
     if (strcmp(type, "events_since") == 0) {
         handle_events_since(op, line);
         return;
@@ -373,8 +438,14 @@ static void handle_operator_line(int slot, const char *line) {
     /* Otherwise: a command to forward to the cabinet. */
     char id[64] = {0};
     extract_str(line, "id", id, sizeof(id));
-    if (id[0] == '\0' || g_cabinet_fd < 0 || !g_cabinet_authed) {
-        send_line(op->fd, "{\"type\":\"error\",\"error\":\"no cabinet connected\"}");
+    char want_host[16] = {0};
+    extract_str(line, "host", want_host, sizeof(want_host));
+    const char *route_err = NULL;
+    Cabinet *cab = pick_cabinet(want_host, &route_err);
+    if (id[0] == '\0' || !cab) {
+        char eb[256];
+        snprintf(eb, sizeof(eb), "{\"type\":\"error\",\"error\":\"%s\"}", id[0] == '\0' ? "missing id" : route_err);
+        send_line(op->fd, eb);
         return;
     }
     int pslot = -1;
@@ -391,21 +462,29 @@ static void handle_operator_line(int slot, const char *line) {
        longer than a ping; give it 90s instead of the default */
     g_pending[pslot].deadline = time(NULL) + (strcmp(type, "flash_hex") == 0 ? 90 : g_command_timeout_s);
     g_pending[pslot].used = 1;
-    send_line(g_cabinet_fd, line);
+    send_line(cab->fd, line);
 }
 
-static void handle_cabinet_line(const char *line) {
-    if (!g_cabinet_authed) {
-        char type[32] = {0}, token[256] = {0};
+static void handle_cabinet_line(Cabinet *cab, const char *line) {
+    if (!cab->authed) {
+        char type[32] = {0}, token[256] = {0}, host[16] = {0};
         extract_str(line, "type", type, sizeof(type));
         extract_str(line, "token", token, sizeof(token));
+        extract_str(line, "host", host, sizeof(host));
         if (strcmp(type, "hello") == 0 && strcmp(token, g_client_token) == 0) {
-            g_cabinet_authed = 1;
-            send_line(g_cabinet_fd, "{\"type\":\"hello_ok\"}");
-            fprintf(stderr, "[relay] cabinet connected\n");
+            cab->host = strcmp(host, "android") == 0 ? HOST_ANDROID : HOST_WINDOWS; /* old clients send no host: Windows */
+            /* one connection per host: a reconnect replaces the stale one */
+            for (int i = 0; i < MAX_CABS; i++) {
+                Cabinet *o = &g_cabs[i];
+                if (o != cab && o->in_use && o->authed && o->host == cab->host) { close(o->fd); o->in_use = 0; }
+            }
+            cab->authed = 1;
+            cab->feather = 0;
+            send_line(cab->fd, "{\"type\":\"hello_ok\"}");
+            fprintf(stderr, "[relay] cabinet connected (host=%s)\n", HOST_NAMES[cab->host]);
         } else {
-            close(g_cabinet_fd);
-            g_cabinet_fd = -1;
+            close(cab->fd);
+            cab->in_use = 0;
         }
         return;
     }
@@ -413,6 +492,13 @@ static void handle_cabinet_line(const char *line) {
         char t[32] = {0};
         extract_str(line, "type", t, sizeof(t));
         if (strcmp(t, "log") == 0) { handle_cabinet_log(line); return; }
+        if (strcmp(t, "link") == 0) {
+            int f = 0;
+            extract_int(line, "feather", &f);
+            cab->feather = f ? 1 : 0;
+            fprintf(stderr, "[relay] host=%s feather %s\n", HOST_NAMES[cab->host], cab->feather ? "attached" : "detached");
+            return;
+        }
     }
     char id[64] = {0};
     extract_str(line, "id", id, sizeof(id));
@@ -441,9 +527,9 @@ static int ingest(char *buf, size_t *buflen, const unsigned char *chunk, size_t 
     while ((nl = strchr(start, '\n')) != NULL) {
         *nl = '\0';
         if (strlen(start) > 0) {
-            if (slot < 0) handle_cabinet_line(start); else device_or_operator_dispatch(slot, start);
+            if (slot < 0) handle_cabinet_line(&g_cabs[-slot - 1], start); else device_or_operator_dispatch(slot, start);
         }
-        if (slot < 0 ? g_cabinet_fd < 0 : !g_operators[slot].in_use) return 0;
+        if (slot < 0 ? !g_cabs[-slot - 1].in_use : !g_operators[slot].in_use) return 0;
         start = nl + 1;
     }
     size_t remaining = strlen(start);
@@ -539,7 +625,8 @@ int main(void) {
         int maxfd = 0;
         FD_SET(cabinet_listen_fd, &rfds); if (cabinet_listen_fd > maxfd) maxfd = cabinet_listen_fd;
         FD_SET(operator_listen_fd, &rfds); if (operator_listen_fd > maxfd) maxfd = operator_listen_fd;
-        if (g_cabinet_fd >= 0) { FD_SET(g_cabinet_fd, &rfds); if (g_cabinet_fd > maxfd) maxfd = g_cabinet_fd; }
+        for (int i = 0; i < MAX_CABS; i++)
+            if (g_cabs[i].in_use) { FD_SET(g_cabs[i].fd, &rfds); if (g_cabs[i].fd > maxfd) maxfd = g_cabs[i].fd; }
         for (int i = 0; i < MAX_OPERATORS; i++) {
             if (g_operators[i].in_use) {
                 FD_SET(g_operators[i].fd, &rfds);
@@ -561,13 +648,14 @@ int main(void) {
         if (FD_ISSET(cabinet_listen_fd, &rfds)) {
             int fd = tcp_accept_raw(cabinet_listen_fd);
             if (fd >= 0) {
-                if (g_cabinet_fd >= 0) tcp_close_raw(g_cabinet_fd);
-                if (sec_server_begin(&g_cabinet_sec, fd) < 0) { tcp_close_raw(fd); }
+                int cs = -1;
+                for (int i = 0; i < MAX_CABS; i++) if (!g_cabs[i].in_use) { cs = i; break; }
+                if (cs < 0) { tcp_close_raw(fd); } /* more unauthenticated peers than slots: refuse, the reaper frees stale ones */
                 else {
-                    g_cabinet_fd = fd;
-                    g_cabinet_accepted = time(NULL);
-                    g_cabinet_authed = 0;
-                    g_cabinet_buflen = 0;
+                    Cabinet *c = &g_cabs[cs];
+                    memset(c, 0, sizeof(*c));
+                    if (sec_server_begin(&c->sec, fd) < 0) { tcp_close_raw(fd); }
+                    else { c->fd = fd; c->accepted = time(NULL); c->in_use = 1; }
                 }
             }
         }
@@ -590,12 +678,13 @@ int main(void) {
                 }
             }
         }
-        if (g_cabinet_fd >= 0 && FD_ISSET(g_cabinet_fd, &rfds)) {
-            if (!pump(&g_cabinet_sec, g_cabinet_buf, &g_cabinet_buflen, -1)) {
-                fprintf(stderr, "[relay] cabinet disconnected\n");
-                close(g_cabinet_fd);
-                g_cabinet_fd = -1;
-                g_cabinet_authed = 0;
+        for (int i = 0; i < MAX_CABS; i++) {
+            Cabinet *c = &g_cabs[i];
+            if (!c->in_use || !FD_ISSET(c->fd, &rfds)) continue;
+            if (!pump(&c->sec, c->buf, &c->buflen, -(i + 1)) && c->in_use) {
+                fprintf(stderr, "[relay] cabinet disconnected (host=%s)\n", c->authed ? HOST_NAMES[c->host] : "?");
+                close(c->fd);
+                c->in_use = 0;
             }
         }
         for (int i = 0; i < MAX_OPERATORS; i++) {

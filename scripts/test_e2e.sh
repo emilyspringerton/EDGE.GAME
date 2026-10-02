@@ -236,6 +236,42 @@ try:
 except BlockingIOError:
     got = b""
 check("the bytes really arrive on the Feather side of the port", b"ping\n", got)
+# ---- two hosts, one Feather (card #478): the Windows PC and the Android tablet may both be online, but the
+# Feather's single USB link is on one of them; commands follow the link, or an explicit "host" ----
+android = subprocess.Popen([BIN + "/edge_client", "127.0.0.1", os.environ["EDGE_CLIENT_PORT"], os.environ["EDGE_CLIENT_TOKEN"]],
+                           env=dict(os.environ, EDGE_HOST="android"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1.0)
+op.send({"type": "hosts"})
+hs = json.loads(op.recv())
+check("hosts lists both connected hosts, only Windows holding the Feather", ([("windows", True), ("android", False)], "windows"),
+      ([(i["host"], i["feather"]) for i in hs.get("items", [])], hs.get("feather_host")))
+op.send({"id": "h1", "type": "serial_write", "payload": {"data": "x", "newline": 0}})
+h1 = json.loads(op.recv())
+check("a command with no host goes to the host that has the Feather", (True, 1), (h1.get("ok"), h1.get("bytes")))
+op.send({"id": "h2", "type": "serial_write", "host": "android", "payload": {"data": "x", "newline": 0}})
+h2 = json.loads(op.recv())
+check("an explicit host=android reaches the tablet, which has no serial port open", (False, True), (h2.get("ok"), "no serial port" in h2.get("error", "")))
+op.send({"id": "h3", "type": "serial_write", "host": "mars", "payload": {"data": "x"}})
+check("an unknown host is refused with a reason", True, "not connected" in json.loads(op.recv()).get("error", ""))
+am, asl = pty.openpty(); tty.setraw(am)
+op.send({"id": "h4", "type": "serial_open", "host": "android", "payload": {"port": os.ttyname(asl), "baud": 115200}})
+check("the tablet can open a port too", True, json.loads(op.recv()).get("ok") is True)
+time.sleep(0.3)
+op.send({"type": "hosts"})
+hs2 = json.loads(op.recv())
+check("both hosts claiming the Feather is reported as a conflict", "conflict", hs2.get("feather_host"))
+op.send({"id": "h5", "type": "serial_write", "payload": {"data": "x"}})
+check("an ambiguous command is refused, not guessed", True, "claim the Feather" in json.loads(op.recv()).get("error", ""))
+op.send({"id": "h6", "type": "serial_close", "host": "android", "payload": {}})
+json.loads(op.recv())
+time.sleep(0.3)
+op.send({"type": "hosts"})
+check("after the tablet lets go, Windows holds the link again", "windows", json.loads(op.recv()).get("feather_host"))
+android.kill(); android.wait()
+time.sleep(0.5)
+op.send({"type": "hosts"})
+check("a disconnected host disappears from the list", ["windows"], [i["host"] for i in json.loads(op.recv()).get("items", [])])
+
 op.send({"id": "s3", "type": "serial_close", "payload": {}})
 check("serial_close acknowledged", True, json.loads(op.recv()).get("ok") is True)
 sub2.close()

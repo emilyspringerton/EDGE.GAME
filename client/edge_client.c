@@ -213,6 +213,14 @@ static void poll_serial(sock_t s) {
     }
 }
 
+/* send_link -- tell the relay whether this host currently has the Feather's USB link (card #478: the
+   Feather is on the Windows PC OR the Android tablet, never both). "Has the link" = its serial port is open. */
+static void send_link(sock_t s) {
+    char l[64];
+    snprintf(l, sizeof(l), "{\"type\":\"link\",\"feather\":%d}", g_sp ? 1 : 0);
+    send_line(s, l);
+}
+
 static void handle_serial_open(sock_t s, const char *id, const char *line) {
     char port[64] = {0}, err[200] = "", resp[600];
     int baud = 115200;
@@ -239,6 +247,7 @@ static void handle_serial_open(sock_t s, const char *id, const char *line) {
         snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"serial_open_result\",\"ok\":false,\"error\":\"%s\"}", id, e2);
     }
     send_line(s, resp);
+    send_link(s);
 }
 
 static void handle_serial_write(sock_t s, const char *id, const char *line) {
@@ -338,6 +347,7 @@ static void handle_flash_hex(sock_t s, const char *id, const char *line) {
         snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"flash_result\",\"ok\":false,\"error\":\"%s\"}", id, e2);
     }
     send_line(s, resp);
+    send_link(s);
 }
 
 
@@ -455,7 +465,11 @@ int main(int argc, char **argv) {
     }
 
     char hello[512];
-    snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"token\":\"%s\"}", token);
+    {   /* EDGE_HOST=android on the tablet build; the PC console is "windows" (also what an old client implied) */
+        const char *eh = getenv("EDGE_HOST");
+        snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"token\":\"%s\",\"host\":\"%s\"}", token,
+                 (eh && strcmp(eh, "android") == 0) ? "android" : "windows");
+    }
     send_line(s, hello);
 
     static char buf[70000];
@@ -520,6 +534,7 @@ int main(int argc, char **argv) {
                     if (g_sp) { serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }
                     snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"serial_close_result\",\"ok\":true}", id);
                     send_line(s, resp);
+                    send_link(s);
                 } else if (id[0] != '\0') {
                     char ack[512];
                     snprintf(ack, sizeof(ack), "{\"id\":\"%s\",\"type\":\"ack\",\"echo\":\"%s\"}", id, type);
