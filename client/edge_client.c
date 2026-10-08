@@ -431,6 +431,20 @@ static int probe_report(char *out, size_t outlen) {
 }
 
 int main(int argc, char **argv) {
+    /* File-backed logging, same pattern BIG_O's day/apps/client/src/main.c already established:
+     * double-clicking a .exe gives you no console to read, and even running from a terminal the
+     * window can close before a crash/early-exit message is visible. Redirect stdout+stderr to a
+     * log file right next to the exe before anything else runs, so even an immediate exit (bad
+     * args, connect failure, handshake failure) is captured. Overwrites each run (not appended) --
+     * this is "what did THIS run do," not a growing history. Best-effort: if the redirect itself
+     * fails (no write permission), both streams silently fall back to the original console. */
+    FILE *log_stdout = freopen("edge_client.log", "w", stdout);
+    FILE *log_stderr = freopen("edge_client.log", "a", stderr);
+    (void)log_stdout;
+    (void)log_stderr;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     if (argc > 1 && strcmp(argv[1], "probe") == 0) { /* standalone: edge_client probe */
         char out[16384];
         if (probe_report(out, sizeof(out)) < 0) { fprintf(stderr, "probe output too large\n"); return 1; }
