@@ -423,6 +423,86 @@ static void handle_editor_get(sock_t s, const char *id, const char *line) {
     free(raw); free(esc); free(resp);
 }
 
+/* handle_exec -- run an arbitrary command on the client host and return its combined stdout+stderr
+ * (card #599, HRIP-ctl: the founder explicitly chose full generic shell-exec over a narrow
+ * HRIP-specific command set -- "Full generic shell-exec... reopens the exact 'no remote control'
+ * door EDGE.GAME's NORTHSTAR says you closed" was presented and picked anyway). Unlike
+ * editor_set/editor_get, there is deliberately NO path/extension allowlist here: this is a real,
+ * wide capability, not a sandboxed one -- it rides the same encrypted (ML-KEM+XChaCha20-Poly1305)
+ * transport as every other command, which is the only boundary this one has.
+ * Output is capped at EXEC_OUT_MAX bytes (truncated, flagged, never silently dropped); there is no
+ * timeout (a hung command hangs the client's single-threaded loop until the process exits or the
+ * connection is killed and the client restarted) -- a known, named limitation, not an oversight. */
+#define EXEC_OUT_MAX 48000
+static void handle_exec(sock_t s, const char *id, const char *line) {
+    char cmd[4000] = {0};
+    FILE *p = NULL;
+    unsigned char *raw = NULL;
+    char *esc = NULL, *resp = NULL;
+    size_t n = 0;
+    int truncated = 0, exit_code = -1;
+    if (!extract_str_unescaped_n(line, "cmd", cmd, sizeof(cmd))) {
+        char e[200];
+        snprintf(e, sizeof(e), "{\"id\":\"%s\",\"type\":\"exec_result\",\"ok\":false,\"error\":\"missing cmd\"}", id);
+        send_line(s, e);
+        return;
+    }
+#ifdef _WIN32
+    {
+        /* parens group the WHOLE command before redirecting -- "%s 2>&1" alone only redirects the
+           last statement of a ";"/"&&" chain, silently dropping earlier stderr (found live, fixed
+           here rather than shipped broken). cmd.exe supports ( ... ) grouping same as POSIX sh. */
+        char full[4300];
+        snprintf(full, sizeof(full), "cmd /C \"( %s ) 2>&1\"", cmd);
+        p = _popen(full, "rb");
+    }
+#else
+    {
+        char full[4300];
+        snprintf(full, sizeof(full), "( %s ) 2>&1", cmd);
+        p = popen(full, "r");
+    }
+#endif
+    if (!p) {
+        char e[300];
+        snprintf(e, sizeof(e), "{\"id\":\"%s\",\"type\":\"exec_result\",\"ok\":false,\"error\":\"failed to start command\"}", id);
+        send_line(s, e);
+        return;
+    }
+    raw = (unsigned char *)malloc(EXEC_OUT_MAX + 1);
+    if (raw) {
+        n = fread(raw, 1, EXEC_OUT_MAX, p);
+        if (n == EXEC_OUT_MAX) {
+            /* drain the rest so the child doesn't block on a full pipe, but discard it */
+            unsigned char junk[4096];
+            size_t got;
+            truncated = 1;
+            while ((got = fread(junk, 1, sizeof(junk), p)) > 0) { (void)got; }
+        }
+    }
+#ifdef _WIN32
+    exit_code = p ? _pclose(p) : -1;
+#else
+    { int st = p ? pclose(p) : -1; exit_code = (st >= 0 && WIFEXITED(st)) ? WEXITSTATUS(st) : st; }
+#endif
+    if (raw) {
+        esc = (char *)malloc(n * 6 + 8);
+        resp = (char *)malloc(n * 6 + 300);
+    }
+    if (raw && esc && resp) {
+        json_escape_bytes(raw, n, esc, n * 6 + 8);
+        snprintf(resp, n * 6 + 300,
+                 "{\"id\":\"%s\",\"type\":\"exec_result\",\"ok\":true,\"exit_code\":%d,\"truncated\":%s,\"output\":\"%s\"}",
+                 id, exit_code, truncated ? "true" : "false", esc);
+        send_line(s, resp);
+    } else {
+        char e[300];
+        snprintf(e, sizeof(e), "{\"id\":\"%s\",\"type\":\"exec_result\",\"ok\":false,\"exit_code\":%d,\"error\":\"out of memory capturing output\"}", id, exit_code);
+        send_line(s, e);
+    }
+    free(raw); free(esc); free(resp);
+}
+
 /* probe_report -- run the USB/COM probe and write its JSON into out (card #493). */
 static int probe_report(char *out, size_t outlen) {
     UsbDev devs[USB_PROBE_MAX];
@@ -543,6 +623,8 @@ int main(int argc, char **argv) {
                     handle_editor_get(s, id, line);
                 } else if (strcmp(type, "flash_hex") == 0 && id[0] != '\0') {
                     handle_flash_hex(s, id, line);
+                } else if (strcmp(type, "exec") == 0 && id[0] != '\0') {
+                    handle_exec(s, id, line);
                 } else if (strcmp(type, "serial_close") == 0 && id[0] != '\0') {
                     char resp[200];
                     if (g_sp) { serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }

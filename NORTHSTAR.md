@@ -90,6 +90,20 @@ this out. Instead:
   the binary and shipped as a new download — "if you need a new tool we need to ship a new binary
   and i will download install and run it." No live code-push, no auto-update assumed.
 
+**2026-10-09, scope widened on purpose (HRIP cross-use):** the access model above was written
+narrowly (serial/USB/AVR-flash/editor-file commands only). Reused here for an unrelated reason —
+giving Claude a way to explore the founder's real Windows machine for the separate `HRIP` project
+(ripping Hearthstone's own card data) — the relay/client pair now also supports a generic `exec`
+command: run any shell command on whichever client is connected, return stdout+stderr+exit code.
+A narrower, HRIP-specific command set (locate-install / list-directory / pull-files-from-one-
+allowlisted-path only, mirroring `editor_name_ok`'s existing no-arbitrary-paths philosophy) was
+named and presented as the safer default; the founder explicitly chose full exec instead. This is
+a real, deliberate widening of "Access model" above, not an accidental scope creep — recorded here
+so a later reader doesn't mistake it for the original narrow design. See `client/edge_client.c`'s
+`handle_exec` and `EMILY/BACKLOG.md`'s own entry for the full detail; no timeout exists yet (a
+hung command blocks the client until it exits or the connection is dropped and the client is
+restarted).
+
 ## Real physical topology (from the founder's own pasted design)
 
 ```

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-09
+- client: new `exec` command (card #599, HRIP work) — relay forwards an arbitrary `cmd` string,
+  the client runs it (`cmd /C "( ... ) 2>&1"` on Windows, `( ... ) 2>&1` on POSIX, both wrapped in
+  a subshell so stderr from every statement in a `;`/`&&` chain is captured, not just the last
+  one — found live, fixed before shipping), captures up to 48000 bytes of combined stdout+stderr
+  (truncated+flagged past that, never silently dropped), and replies with exit code + output over
+  the same existing encrypted (ML-KEM-768 + XChaCha20-Poly1305) transport every other command
+  already uses. Deliberately unlike `editor_set`/`editor_get`: no path/extension allowlist — this
+  is full generic shell-exec, not a sandboxed command. Founder was presented a narrower,
+  HRIP-specific-commands alternative first and explicitly chose full exec instead (logged in
+  `EMILY/BACKLOG.md`). No timeout exists yet — a hung command blocks the client's single-threaded
+  loop until it exits or the connection is killed and the client restarted; named, not hidden.
+  Live-verified end to end (real relay + real client over loopback, `edge_ctl`): a multi-statement
+  command with a failing first statement, correct combined stdout+stderr, correct nonzero exit
+  code. Native build is `-Wall -Wextra -pedantic -Werror` clean; the mingw cross-compile could not
+  be re-verified in this sandbox (mingw gcc unavailable here, same gap the 2026-09-29 entry below
+  already names) — relies on CI's own `client-windows` job to confirm it on the next push.
+
 ## 2026-10-02
 - relay: per-host cabinet connections (windows/android), Feather link reporting, host-aware routing + hosts query (card #478) (sess-20260923-1030-4a526255)
 - sec_transport: frame-counter exhaustion refuses/drops (re-handshake), socketpair unit test under ASan+UBSan, CI unit-test step, README for the Claude loop (sess-20260923-1030-4a526255)
