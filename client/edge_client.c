@@ -594,7 +594,7 @@ static int obtain_token_via_browser(char *token_out, size_t cap) {
 
     char redirect_uri[128], login_url[768];
     snprintf(redirect_uri, sizeof(redirect_uri), "http://127.0.0.1:%d/callback", port);
-    snprintf(login_url, sizeof(login_url), "%s/api/v1/auth/sso/login?redirect_uri=%s", iduna_base, redirect_uri);
+    snprintf(login_url, sizeof(login_url), "%s/api/v1/auth/sso/login?logout=1&redirect_uri=%s", iduna_base, redirect_uri);
     open_browser(login_url);
 
     for (;;) {
@@ -632,6 +632,26 @@ static int obtain_token_via_browser(char *token_out, size_t cap) {
         }
         CLOSESOCK(c);
     }
+}
+
+/* edge_exit -- double-clicked .exe windows vanish on exit, hiding the reason (founder: "the terminal
+ * window closes after i sign in"). stdout/stderr are redirected to edge_client.log, so on Windows write
+ * the final status to the real console and wait for Enter; elsewhere just return the code. */
+static int g_authed = 0;
+static int edge_exit(int code, const char *msg) {
+    fprintf(stderr, "[edge_client] %s\n", msg);
+#ifdef _WIN32
+    {
+        FILE *con = fopen("CONOUT$", "w");
+        FILE *cin = fopen("CONIN$", "r");
+        if (con) {
+            fprintf(con, "\n[edge_client] %s\nDetails: edge_client.log (next to this exe). Press Enter to close.\n", msg);
+            fflush(con);
+        }
+        if (cin) { int c; do { c = fgetc(cin); } while (c != '\n' && c != EOF); }
+    }
+#endif
+    return code;
 }
 
 int main(int argc, char **argv) {
@@ -673,7 +693,7 @@ int main(int argc, char **argv) {
     }
 
     sock_t s = connect_to(host, port);
-    if (s == INVALID_SOCKET) { fprintf(stderr, "connect failed\n"); return 1; }
+    if (s == INVALID_SOCKET) return edge_exit(1, "could not reach the relay (connect failed) -- check the host/port and your network");
 
     {
         unsigned char pin[SEC_PIN_BYTES];
@@ -686,7 +706,7 @@ int main(int argc, char **argv) {
         pol.hostport = hostport;
         if (pin_hex && *pin_hex && !pol.pin) { fprintf(stderr, "EDGE_SERVER_PIN must be 64 hex chars\n"); return 1; }
         int hs = sec_client_handshake(&g_sec, (int)s, sec_verify_pin_or_tofu, &pol);
-        if (hs != 0) { fprintf(stderr, "secure handshake failed (%d)\n", hs); return 1; }
+        if (hs != 0) { char m[96]; snprintf(m, sizeof(m), "secure handshake with the relay failed (%d)", hs); return edge_exit(1, m); }
     }
 
     char hello[2300]; /* token can be a ~2000-char IDUNA JWT now, not just a short shared secret */
@@ -729,7 +749,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[edge_client] received: %s\n", line);
 
                 if (strcmp(type, "hello_ok") == 0) {
-                    fprintf(stderr, "[edge_client] authenticated\n");
+                    fprintf(stderr, "[edge_client] authenticated\n"); g_authed = 1;
                 } else if (strcmp(type, "route") == 0 && id[0] != '\0') {
                     int source = 0;
                     extract_int(line, "source", &source);
@@ -779,5 +799,6 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     WSACleanup();
 #endif
-    return 0;
+    if (!g_authed) return edge_exit(2, "the relay closed the connection before accepting sign-in -- your IDUNA account probably lacks the edge.game.operator permission, or the token was rejected");
+    return edge_exit(0, "disconnected from the relay");
 }

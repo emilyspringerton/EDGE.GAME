@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-10-09 (cont. 4)
+- client: the console window no longer vanishes. On Windows, `edge_exit` writes the final status to the real console and waits for Enter (stdout/stderr go to edge_client.log). If the relay closes the connection before accepting the sign-in, it now says so (account probably lacks `edge.game.operator`, or the token was rejected) instead of a bare "connection closed". The sign-in URL now carries `logout=1` so IDUNA's SSO page cannot silently reuse a remembered pre-permissions token; every launch mints a fresh JWT with current permissions.
+
 ## 2026-10-09 (cont. 3)
 - deploy: relay is now LIVE in the cluster at 34.63.32.219:8091 (cabinet) / :8092 (operator), via the
   shared tcp-edge (no new LoadBalancer). Found a stale hand-applied edge-relay (own LB 136.64.148.153,
