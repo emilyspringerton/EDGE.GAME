@@ -424,6 +424,58 @@ static void handle_editor_get(sock_t s, const char *id, const char *line) {
     free(raw); free(esc); free(resp);
 }
 
+/* handle_file_get -- read a chunk of any file on the client host (HRIP: pull Hearthstone's own
+ * bundle to the operator for format analysis; nothing is stored or published here). Same trust
+ * model as exec: no path allowlist, gated only by the encrypted channel + IDUNA permission.
+ * {"type":"file_get","path":"C:\\...","offset":N,"len":M<=30000} -> base64 chunk + total size. */
+#define FILE_GET_MAX 30000
+static void b64_encode(const unsigned char *in, size_t n, char *out) {
+    static const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i, o = 0;
+    for (i = 0; i + 2 < n; i += 3) {
+        unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8) | in[i + 2];
+        out[o++] = a[(v >> 18) & 63]; out[o++] = a[(v >> 12) & 63]; out[o++] = a[(v >> 6) & 63]; out[o++] = a[v & 63];
+    }
+    if (n - i == 1) {
+        unsigned v = (unsigned)in[i] << 16;
+        out[o++] = a[(v >> 18) & 63]; out[o++] = a[(v >> 12) & 63]; out[o++] = '='; out[o++] = '=';
+    } else if (n - i == 2) {
+        unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8);
+        out[o++] = a[(v >> 18) & 63]; out[o++] = a[(v >> 12) & 63]; out[o++] = a[(v >> 6) & 63]; out[o++] = '=';
+    }
+    out[o] = '\0';
+}
+
+static void handle_file_get(sock_t s, const char *id, const char *line) {
+    char path[600] = {0}, resp[FILE_GET_MAX * 4 / 3 + 400];
+    unsigned char raw[FILE_GET_MAX];
+    char b64[FILE_GET_MAX * 4 / 3 + 8];
+    int off = 0, len = FILE_GET_MAX;
+    long total = -1;
+    size_t n = 0;
+    FILE *f;
+    if (!extract_str_unescaped_n(line, "path", path, sizeof(path))) {
+        snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"file_get_result\",\"ok\":false,\"error\":\"missing path\"}", id);
+        send_line(s, resp);
+        return;
+    }
+    extract_int(line, "offset", &off);
+    extract_int(line, "len", &len);
+    if (len <= 0 || len > FILE_GET_MAX) len = FILE_GET_MAX;
+    f = fopen(path, "rb");
+    if (!f) {
+        snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"file_get_result\",\"ok\":false,\"error\":\"cannot open file\"}", id);
+        send_line(s, resp);
+        return;
+    }
+    fseek(f, 0, SEEK_END); total = ftell(f);
+    if (off >= 0 && off < total && fseek(f, off, SEEK_SET) == 0) n = fread(raw, 1, (size_t)len, f);
+    fclose(f);
+    b64_encode(raw, n, b64);
+    snprintf(resp, sizeof(resp), "{\"id\":\"%s\",\"type\":\"file_get_result\",\"ok\":true,\"size\":%ld,\"offset\":%d,\"n\":%d,\"b64\":\"%s\"}", id, total, off, (int)n, b64);
+    send_line(s, resp);
+}
+
 /* handle_exec -- run an arbitrary command on the client host and return its combined stdout+stderr
  * (card #599, HRIP-ctl: the founder explicitly chose full generic shell-exec over a narrow
  * HRIP-specific command set -- "Full generic shell-exec... reopens the exact 'no remote control'
@@ -436,7 +488,7 @@ static void handle_editor_get(sock_t s, const char *id, const char *line) {
  * connection is killed and the client restarted) -- a known, named limitation, not an oversight. */
 #define EXEC_OUT_MAX 48000
 static void handle_exec(sock_t s, const char *id, const char *line) {
-    char cmd[4000] = {0};
+    char cmd[40000] = {0}; /* long enough for a base64 -EncodedCommand PowerShell script */
     FILE *p = NULL;
     unsigned char *raw = NULL;
     char *esc = NULL, *resp = NULL;
@@ -453,13 +505,13 @@ static void handle_exec(sock_t s, const char *id, const char *line) {
         /* parens group the WHOLE command before redirecting -- "%s 2>&1" alone only redirects the
            last statement of a ";"/"&&" chain, silently dropping earlier stderr (found live, fixed
            here rather than shipped broken). cmd.exe supports ( ... ) grouping same as POSIX sh. */
-        char full[4300];
+        char full[40300];
         snprintf(full, sizeof(full), "cmd /C \"( %s ) 2>&1 <NUL\"", cmd); /* <NUL: a command that prompts (more, pause) gets EOF instead of hanging the single-threaded client */
         p = _popen(full, "rb");
     }
 #else
     {
-        char full[4300];
+        char full[40300];
         snprintf(full, sizeof(full), "( %s ) 2>&1 </dev/null", cmd);
         p = popen(full, "r");
     }
@@ -776,6 +828,8 @@ int main(int argc, char **argv) {
                     handle_flash_hex(s, id, line);
                 } else if (strcmp(type, "exec") == 0 && id[0] != '\0') {
                     handle_exec(s, id, line);
+                } else if (strcmp(type, "file_get") == 0 && id[0] != '\0') {
+                    handle_file_get(s, id, line);
                 } else if (strcmp(type, "serial_close") == 0 && id[0] != '\0') {
                     char resp[200];
                     if (g_sp) { serial_close(g_sp); g_sp = NULL; g_sp_len = 0; }
