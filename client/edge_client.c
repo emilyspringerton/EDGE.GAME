@@ -454,13 +454,13 @@ static void handle_exec(sock_t s, const char *id, const char *line) {
            last statement of a ";"/"&&" chain, silently dropping earlier stderr (found live, fixed
            here rather than shipped broken). cmd.exe supports ( ... ) grouping same as POSIX sh. */
         char full[4300];
-        snprintf(full, sizeof(full), "cmd /C \"( %s ) 2>&1\"", cmd);
+        snprintf(full, sizeof(full), "cmd /C \"( %s ) 2>&1 <NUL\"", cmd); /* <NUL: a command that prompts (more, pause) gets EOF instead of hanging the single-threaded client */
         p = _popen(full, "rb");
     }
 #else
     {
         char full[4300];
-        snprintf(full, sizeof(full), "( %s ) 2>&1", cmd);
+        snprintf(full, sizeof(full), "( %s ) 2>&1 </dev/null", cmd);
         p = popen(full, "r");
     }
 #endif
