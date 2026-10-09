@@ -128,9 +128,10 @@ relay: build build/libvendor.a
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) -c server/relay_main.c -o server/relay_main.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -c common/sec_transport.c -o server/sec_transport.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -c client/runtime/parena_runtime.c -o server/parena_runtime.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -Wno-deprecated-declarations -c common/jwt_verify.c -o server/jwt_verify.o
 	$(CC) -o build/edge_relay server/relay_main.o server/sec_transport.o server/parena_runtime.o \
 		server/reflux_runtime.o server/tcp_llvm_glue.o server/reflux_gen.o server/tcp_llvm_gen.o \
-		build/libvendor.a -lm
+		server/jwt_verify.o build/libvendor.a -lm -lcrypto
 
 run-relay: relay
 	./build/edge_relay

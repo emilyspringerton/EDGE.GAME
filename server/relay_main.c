@@ -43,6 +43,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <stdio.h>
+#include "../common/jwt_verify.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -152,6 +153,7 @@ static const char *g_client_token;
 static const char *g_operator_token;
 static const char *g_pi_token;
 static int g_command_timeout_s;
+static JwtKey *g_jwt_key; /* NULL if EDGE_IDUNA_JWKS_FILE is unset -- JWT-operator auth disabled */
 
 /* Every socket is a SecConn (ML-KEM handshake + LZ4 + XChaCha20-Poly1305, see sec_transport.h):
    send_line finds the connection for an fd and encrypts. A peer that hasn't finished the handshake
@@ -557,14 +559,28 @@ static int pump(SecConn *sc, char *buf, size_t *buflen, int slot) {
     }
 }
 
+/* operator_token_authorized -- true if `token` is either the static shared EDGE_OPERATOR_TOKEN
+ * (unchanged, back-compat) OR a real IDUNA-issued JWT whose signature verifies against the pinned
+ * JWKS AND whose "permissions" claim contains "edge.game.operator" (card #599 follow-up:
+ * EDGE-599-FOLLOWUP-1, EMILY/BACKLOG.md). The JWT path is only attempted when g_jwt_key is set
+ * (EDGE_IDUNA_JWKS_FILE configured) -- real, named limitation: no "exp" check, one pinned key, no
+ * JWKS rotation (see jwt_verify.h's own header comment). */
+static int operator_token_authorized(const char *token) {
+    char perms[2000];
+    if (strcmp(token, g_operator_token) == 0) return 1;
+    if (!g_jwt_key) return 0;
+    if (!jwt_verify_es256(g_jwt_key, token, perms, (int)sizeof(perms))) return 0;
+    return jwt_permissions_contains(perms, "edge.game.operator");
+}
+
 static void device_or_operator_dispatch(int slot, const char *line) {
     OperatorConn *op = &g_operators[slot];
     if (!op->authed) {
-        char type[32] = {0}, token[256] = {0};
+        char type[32] = {0}, token[2000] = {0};
         extract_str(line, "type", type, sizeof(type));
         extract_str(line, "token", token, sizeof(token));
         if (strcmp(type, "hello") != 0) { close(op->fd); op->in_use = 0; return; }
-        if (strcmp(token, g_operator_token) == 0) {
+        if (operator_token_authorized(token)) {
             op->authed = 1;
             send_line(op->fd, "{\"type\":\"hello_ok\",\"role\":\"operator\"}");
         } else if (strcmp(token, g_client_token) == 0 || (g_pi_token && *g_pi_token && strcmp(token, g_pi_token) == 0)) {
@@ -597,6 +613,15 @@ int main(void) {
     if (!g_client_token || !*g_client_token || !g_operator_token || !*g_operator_token) {
         fprintf(stderr, "EDGE_CLIENT_TOKEN and EDGE_OPERATOR_TOKEN must both be set\n");
         return 1;
+    }
+    {
+        const char *jwks_path = getenv("EDGE_IDUNA_JWKS_FILE");
+        if (jwks_path && *jwks_path) {
+            g_jwt_key = jwt_key_load_file(jwks_path);
+            if (!g_jwt_key) fprintf(stderr, "[relay] WARNING: failed to load JWKS from %s -- JWT operator auth disabled, static token still works\n", jwks_path);
+        } else {
+            fprintf(stderr, "[relay] EDGE_IDUNA_JWKS_FILE not set -- JWT operator auth disabled, static EDGE_OPERATOR_TOKEN only\n");
+        }
     }
 
     const char *key_path = getenv("EDGE_KEY_FILE");

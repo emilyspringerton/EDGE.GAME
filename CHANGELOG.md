@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-10-09 (cont.)
+- relay: real ES256 JWT verification for operator auth (EDGE-599-FOLLOWUP-1). New
+  `common/jwt_verify.{h,c}` (OpenSSL EC/ECDSA, `-lcrypto`) parses a pinned local JWKS file
+  (`EDGE_IDUNA_JWKS_FILE`, fetched once via `curl https://iam.okemily.com/.well-known/jwks.json`),
+  verifies a presented operator token's ES256 signature, and checks its `permissions` claim for
+  `edge.game.operator` -- the permission IDUNA's `PlayerEmailAuthHandler` now grants (see IDUNA's
+  own 2026-10-09 entry). Falls back to the existing static `EDGE_OPERATOR_TOKEN` unchanged if the
+  presented token doesn't verify or `EDGE_IDUNA_JWKS_FILE` is unset — fully backward compatible,
+  no existing usage breaks. `edge_ctl` needed zero changes: it already accepts an arbitrary token
+  string, so a real IDUNA JWT works as a drop-in replacement for the shared secret.
+  Live-verified against a REAL IDUNA-issued JWT (registered a throwaway test account against the
+  live `wotan.okemily.com` API): correct signature verification, correct `permissions` array
+  extraction (empty, as expected for an unlisted email), correctly REJECTS a forged token (payload
+  tampered to claim `edge.game.operator`, old signature kept) and a garbage string. Named, real
+  limitations (see `jwt_verify.h`'s own header comment): no `exp` check, one pinned key (no JWKS
+  rotation/multi-`kid` support). `make relay` itself could not be rebuilt end to end in this
+  sandbox (missing `llc`, same pre-existing gap as the last entry below) — `jwt_verify.c` and the
+  modified `relay_main.c` were each compiled standalone and warning-clean
+  (`-Wall -Wextra -pedantic -Werror`, `-Wno-deprecated-declarations` scoped to just the OpenSSL
+  EC_KEY calls in `jwt_verify.c`); relying on CI's `relay` build job to confirm the full link.
+
 ## 2026-10-09
 - client: new `exec` command (card #599, HRIP work) — relay forwards an arbitrary `cmd` string,
   the client runs it (`cmd /C "( ... ) 2>&1"` on Windows, `( ... ) 2>&1` on POSIX, both wrapped in

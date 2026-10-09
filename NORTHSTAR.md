@@ -104,6 +104,14 @@ so a later reader doesn't mistake it for the original narrow design. See `client
 hung command blocks the client until it exits or the connection is dropped and the client is
 restarted).
 
+**2026-10-09, relay-side enforcement shipped**: the relay now also accepts a real IDUNA-issued
+JWT as the operator token (`common/jwt_verify.{h,c}`, ES256 via OpenSSL, checked against a
+pinned local JWKS file), requiring the `edge.game.operator` permission — not just the static
+shared `EDGE_OPERATOR_TOKEN`. IDUNA's `PlayerEmailAuthHandler` grants that permission to
+`emilyspringerton@gmail.com` (see `IDUNA/CHANGELOG.md`). Still open: the client's own
+batteries-included browser-login UX (open the browser to IDUNA's SSO page, capture the JWT via a
+localhost redirect) is not built — an operator still has to obtain and paste a JWT by hand today.
+
 ## Real physical topology (from the founder's own pasted design)
 
 ```
