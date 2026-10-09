@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-09 (cont. 3)
+- deploy: relay is now LIVE in the cluster at 34.63.32.219:8091 (cabinet) / :8092 (operator), via the
+  shared tcp-edge (no new LoadBalancer). Found a stale hand-applied edge-relay (own LB 136.64.148.153,
+  pre-JWT binary, emptyDir key) and replaced it: `ops/docker/relay.Dockerfile` + `scripts/build-image.sh`
+  (binary-staging stopgap; `make relay` built here after fetching llc no-sudo), edge-relay:v2 with
+  IDUNA JWKS baked in, PVC for a stable ML-KEM key/pin, gitops spec in EMILY. Live-verified from outside
+  the cluster (hello_ok over the encrypted channel). Client now defaults to this host
+  (`EDGE_RELAY_HOST` overrides), so `edge_client.exe` needs no arguments: it signs in via the browser,
+  then connects. Fingerprint pins on first contact (TOFU); it changes only if the PVC is lost.
+
 ## 2026-10-09 (cont. 2)
 - client + relay: batteries-included browser login (EDGE-599-FOLLOWUP-2). Founder real-time: "the
   oauth isnt in the client yet i still get this [usage: edge_client.exe <host> <port> <token>] on

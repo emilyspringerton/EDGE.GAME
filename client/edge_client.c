@@ -655,7 +655,7 @@ int main(int argc, char **argv) {
         printf("%s\n", out);
         return 0;
     }
-    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    const char *host = argc > 1 ? argv[1] : (getenv("EDGE_RELAY_HOST") ? getenv("EDGE_RELAY_HOST") : "34.63.32.219"); /* the live relay behind tcp-edge */
     int port = argc > 2 ? atoi(argv[2]) : 8091;
     const char *token = argc > 3 ? argv[3] : getenv("EDGE_CLIENT_TOKEN");
     static char browser_token[2000];
