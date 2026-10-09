@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-10-09 (cont. 2)
+- client + relay: batteries-included browser login (EDGE-599-FOLLOWUP-2). Founder real-time: "the
+  oauth isnt in the client yet i still get this [usage: edge_client.exe <host> <port> <token>] on
+  v12." Run `edge_client.exe <host> <port>` with no token at all and the client now opens the
+  founder's own browser to IDUNA's existing SSO login page, captures the real JWT back via the
+  classic desktop-OAuth loopback pattern (`obtain_token_via_browser`: a tiny local HTTP listener
+  on 127.0.0.1, since the SSO page hands the token back as a URL FRAGMENT a browser never sends to
+  a server — the served callback page's own JS reads `location.hash` and POSTs it back
+  same-origin to `/complete`), and uses that real token for the cabinet hello.
+  `relay_main.c`'s `jwt_authorized` (previously operator-only) now also gates the CABINET hello —
+  one real IDUNA identity covers both `edge_client.exe` (the founder's machine) and `edge_ctl`
+  (the operator/me), replacing two separate static shared secrets with one real permission check.
+  Live-verified end to end in this sandbox (simulated the browser's own two requests with curl
+  against a real running client): correct login-URL construction, correct token capture from the
+  simulated redirect, correct use of the captured token in the relay hello (rejected by the old,
+  still-deployed pre-JWT relay binary exactly as expected — not a bug, that binary predates this
+  change and `make relay` can't be rebuilt end to end in this sandbox, same `llc`-missing gap as
+  before). `client-windows` Makefile target now links `-lshell32` for `ShellExecuteA`.
+  Native client build (`-DPARENA_NO_GRAPHICS`, warning-clean) succeeded; mingw cross-compile
+  relies on CI's own `client-windows` job as before.
+
 ## 2026-10-09 (cont.)
 - relay: real ES256 JWT verification for operator auth (EDGE-599-FOLLOWUP-1). New
   `common/jwt_verify.{h,c}` (OpenSSL EC/ECDSA, `-lcrypto`) parses a pinned local JWKS file

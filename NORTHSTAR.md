@@ -108,9 +108,17 @@ restarted).
 JWT as the operator token (`common/jwt_verify.{h,c}`, ES256 via OpenSSL, checked against a
 pinned local JWKS file), requiring the `edge.game.operator` permission — not just the static
 shared `EDGE_OPERATOR_TOKEN`. IDUNA's `PlayerEmailAuthHandler` grants that permission to
-`emilyspringerton@gmail.com` (see `IDUNA/CHANGELOG.md`). Still open: the client's own
-batteries-included browser-login UX (open the browser to IDUNA's SSO page, capture the JWT via a
-localhost redirect) is not built — an operator still has to obtain and paste a JWT by hand today.
+`emilyspringerton@gmail.com` via a real, admin-manageable grant (`IDUNA`'s Back Office `/admin/gm`
+tool), not a code change per account — see `IDUNA/CHANGELOG.md`.
+
+**2026-10-09, client-side browser login shipped too**: `edge_client.exe` (the cabinet binary that
+runs on the founder's own Windows machine) no longer requires a manually-typed token. Run it with
+no token and it opens the default browser to IDUNA's SSO login page itself, captures the real JWT
+back via a loopback HTTP listener (`obtain_token_via_browser` in `client/edge_client.c`), and uses
+it for the cabinet hello — `jwt_authorized` in the relay now gates BOTH the cabinet and operator
+hello, so one real IDUNA identity (and one real permission, `edge.game.operator`) covers the
+founder's own machine and the operator (me) alike, replacing the two separate static shared
+secrets entirely for anyone who has that permission. The static tokens still work as a fallback.
 
 ## Real physical topology (from the founder's own pasted design)
 

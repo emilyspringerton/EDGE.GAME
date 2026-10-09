@@ -86,7 +86,7 @@ edge-ctl: build build/libvendor.a
 client-windows: build build/libvendor_win.a
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
 		client/edge_client.c client/usb_probe.c client/serial_port.c client/avr109.c $(SEC_SRCS) build/libvendor_win.a \
-		-o build/edge_client.exe -lws2_32 -ladvapi32 -lm
+		-o build/edge_client.exe -lws2_32 -ladvapi32 -lshell32 -lm
 	$(CC_WIN) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
 		client/edge_ctl.c $(SEC_SRCS) build/libvendor_win.a \
 		-o build/edge_ctl.exe -lws2_32 -ladvapi32 -lm

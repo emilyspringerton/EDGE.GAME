@@ -37,6 +37,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <shellapi.h>
 typedef SOCKET sock_t;
 #define CLOSESOCK closesocket
 #else
@@ -510,6 +511,129 @@ static int probe_report(char *out, size_t outlen) {
     return usb_probe_json(devs, n, out, outlen);
 }
 
+/* --- batteries-included browser login (EDGE-599-FOLLOWUP-2, founder real-time: "have it oauth
+ * into IDUNA ... i need to run the client and then it opens the chrome into iduna so i can log
+ * in"). Run with no token at all and the client opens the founder's own browser to IDUNA's
+ * existing SSO login page, captures the JWT back via the classic desktop-OAuth loopback pattern
+ * (a tiny local HTTP listener, since the SSO page hands the token back as a URL FRAGMENT --
+ * never sent to a server by a browser -- so the served callback page's own JS reads
+ * location.hash and POSTs it back same-origin), and uses that real IDUNA-issued JWT as the
+ * token for both the cabinet and operator hello (relay_main.c's jwt_authorized). Real, named
+ * limitation: a fixed local port (EDGE_LOGIN_CALLBACK_PORT overrides); if something else on the
+ * machine already holds it, this fails and the operator still has to supply a token the old way. */
+static void open_browser(const char *url) {
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+#else
+    char cmd[900];
+    snprintf(cmd, sizeof(cmd), "xdg-open '%s' >/dev/null 2>&1 &", url);
+    system(cmd); /* best-effort; the printed URL below is the real fallback */
+#endif
+    fprintf(stderr, "[edge_client] opening your browser to sign in to IDUNA.\n"
+                     "[edge_client] if it doesn't open automatically, go to:\n%s\n", url);
+}
+
+static void url_decode(const char *in, size_t inlen, char *out, size_t outcap) {
+    size_t i = 0, o = 0;
+    while (i < inlen && o + 1 < outcap) {
+        if (in[i] == '%' && i + 2 < inlen) {
+            char hx[3] = { in[i + 1], in[i + 2], 0 };
+            out[o++] = (char)strtol(hx, NULL, 16);
+            i += 3;
+        } else if (in[i] == '+') {
+            out[o++] = ' ';
+            i++;
+        } else {
+            out[o++] = in[i++];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* The page served at the loopback redirect_uri. IDUNA's own sso_login.go hands the token back as
+ * "#sso_token=...&player_id=...&display_name=...", never reachable server-side directly -- this
+ * JS is the only way a native app gets it out of the fragment. */
+static const char *CALLBACK_PAGE =
+    "<!doctype html><html><body style=\"font-family:sans-serif;padding:40px\">"
+    "<p id=\"m\">Signing in...</p>"
+    "<script>"
+    "var h = location.hash.substring(1);"
+    "if (h.indexOf('sso_token=') !== -1) {"
+    "  fetch('/complete?' + h).then(function(){document.getElementById('m').textContent='Signed in -- you can close this window.';})"
+    "  .catch(function(){document.getElementById('m').textContent='Something went wrong -- check edge_client.log.';});"
+    "} else { document.getElementById('m').textContent = 'No token received from IDUNA.'; }"
+    "</script></body></html>";
+
+/* obtain_token_via_browser -- blocks until a real token arrives or the listener itself fails to
+ * start. Returns 1 and fills token_out on success, 0 on failure (caller falls back to the old
+ * manual-token usage message). */
+static int obtain_token_via_browser(char *token_out, size_t cap) {
+    int port = 51823;
+    const char *port_env = getenv("EDGE_LOGIN_CALLBACK_PORT");
+    if (port_env && *port_env) port = atoi(port_env);
+    const char *iduna_base = getenv("EDGE_IDUNA_BASE_URL");
+    if (!iduna_base || !*iduna_base) iduna_base = "https://iam.okemily.com";
+
+    sock_t listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd == INVALID_SOCKET) return 0;
+    {
+        int one = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* 127.0.0.1 only -- never exposed off-box */
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR || listen(listen_fd, 1) == SOCKET_ERROR) {
+        fprintf(stderr, "[edge_client] could not open local port %d for sign-in (already in use?) -- "
+                        "set EDGE_LOGIN_CALLBACK_PORT to another port, or pass a token directly.\n", port);
+        CLOSESOCK(listen_fd);
+        return 0;
+    }
+
+    char redirect_uri[128], login_url[768];
+    snprintf(redirect_uri, sizeof(redirect_uri), "http://127.0.0.1:%d/callback", port);
+    snprintf(login_url, sizeof(login_url), "%s/api/v1/auth/sso/login?redirect_uri=%s", iduna_base, redirect_uri);
+    open_browser(login_url);
+
+    for (;;) {
+        sock_t c = accept(listen_fd, NULL, NULL);
+        if (c == INVALID_SOCKET) continue;
+        char buf[8000] = {0};
+        int n = recv(c, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) { CLOSESOCK(c); continue; }
+        buf[n] = '\0';
+        char path[512] = {0};
+        sscanf(buf, "GET %511s", path); /* narrow, self-controlled: only ever "/callback" or "/complete?..." */
+        char *q = strchr(path, '?');
+        if (strncmp(path, "/complete", 9) == 0 && q) {
+            char *t = strstr(q + 1, "sso_token=");
+            if (t) {
+                t += strlen("sso_token=");
+                char *end = strchr(t, '&');
+                size_t tl = end ? (size_t)(end - t) : strlen(t);
+                url_decode(t, tl, token_out, cap);
+                static const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok";
+                send(c, resp, (int)strlen(resp), 0);
+                CLOSESOCK(c);
+                CLOSESOCK(listen_fd);
+                return token_out[0] != '\0';
+            }
+            static const char *bad = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+            send(c, bad, (int)strlen(bad), 0);
+            CLOSESOCK(c);
+            continue;
+        }
+        {
+            char resp[2400];
+            int rn = snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n%s", CALLBACK_PAGE);
+            send(c, resp, rn, 0);
+        }
+        CLOSESOCK(c);
+    }
+}
+
 int main(int argc, char **argv) {
     /* File-backed logging, same pattern BIG_O's day/apps/client/src/main.c already established:
      * double-clicking a .exe gives you no console to read, and even running from a terminal the
@@ -534,12 +658,19 @@ int main(int argc, char **argv) {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
     int port = argc > 2 ? atoi(argv[2]) : 8091;
     const char *token = argc > 3 ? argv[3] : getenv("EDGE_CLIENT_TOKEN");
-    if (!token) { fprintf(stderr, "usage: %s <host> <port> <token>\n", argv[0]); return 1; }
-
+    static char browser_token[2000];
 #ifdef _WIN32
-    WSADATA wsa;
+    WSADATA wsa; /* must run before obtain_token_via_browser's own socket() calls on Windows */
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
+    if (!token) {
+        if (obtain_token_via_browser(browser_token, sizeof(browser_token))) {
+            token = browser_token;
+        } else {
+            fprintf(stderr, "usage: %s <host> <port> <token>  (or run with no token to sign in via browser)\n", argv[0]);
+            return 1;
+        }
+    }
 
     sock_t s = connect_to(host, port);
     if (s == INVALID_SOCKET) { fprintf(stderr, "connect failed\n"); return 1; }
@@ -558,7 +689,7 @@ int main(int argc, char **argv) {
         if (hs != 0) { fprintf(stderr, "secure handshake failed (%d)\n", hs); return 1; }
     }
 
-    char hello[512];
+    char hello[2300]; /* token can be a ~2000-char IDUNA JWT now, not just a short shared secret */
     {   /* EDGE_HOST=android on the tablet build; the PC console is "windows" (also what an old client implied) */
         const char *eh = getenv("EDGE_HOST");
         snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"token\":\"%s\",\"host\":\"%s\"}", token,

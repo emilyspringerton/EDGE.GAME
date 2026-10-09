@@ -154,6 +154,7 @@ static const char *g_operator_token;
 static const char *g_pi_token;
 static int g_command_timeout_s;
 static JwtKey *g_jwt_key; /* NULL if EDGE_IDUNA_JWKS_FILE is unset -- JWT-operator auth disabled */
+static int jwt_authorized(const char *token); /* defined below; used by handle_cabinet_line above its own definition */
 
 /* Every socket is a SecConn (ML-KEM handshake + LZ4 + XChaCha20-Poly1305, see sec_transport.h):
    send_line finds the connection for an fd and encrypts. A peer that hasn't finished the handshake
@@ -469,11 +470,11 @@ static void handle_operator_line(int slot, const char *line) {
 
 static void handle_cabinet_line(Cabinet *cab, const char *line) {
     if (!cab->authed) {
-        char type[32] = {0}, token[256] = {0}, host[16] = {0};
+        char type[32] = {0}, token[2000] = {0}, host[16] = {0};
         extract_str(line, "type", type, sizeof(type));
         extract_str(line, "token", token, sizeof(token));
         extract_str(line, "host", host, sizeof(host));
-        if (strcmp(type, "hello") == 0 && strcmp(token, g_client_token) == 0) {
+        if (strcmp(type, "hello") == 0 && (strcmp(token, g_client_token) == 0 || jwt_authorized(token))) {
             cab->host = strcmp(host, "android") == 0 ? HOST_ANDROID : HOST_WINDOWS; /* old clients send no host: Windows */
             /* one connection per host: a reconnect replaces the stale one */
             for (int i = 0; i < MAX_CABS; i++) {
@@ -559,18 +560,24 @@ static int pump(SecConn *sc, char *buf, size_t *buflen, int slot) {
     }
 }
 
-/* operator_token_authorized -- true if `token` is either the static shared EDGE_OPERATOR_TOKEN
- * (unchanged, back-compat) OR a real IDUNA-issued JWT whose signature verifies against the pinned
- * JWKS AND whose "permissions" claim contains "edge.game.operator" (card #599 follow-up:
- * EDGE-599-FOLLOWUP-1, EMILY/BACKLOG.md). The JWT path is only attempted when g_jwt_key is set
- * (EDGE_IDUNA_JWKS_FILE configured) -- real, named limitation: no "exp" check, one pinned key, no
- * JWKS rotation (see jwt_verify.h's own header comment). */
-static int operator_token_authorized(const char *token) {
+/* jwt_authorized -- true if `token` is a real IDUNA-issued JWT whose signature verifies against
+ * the pinned JWKS AND whose "permissions" claim contains "edge.game.operator" (card #599 /
+ * EDGE-599-FOLLOWUP-1+2, EMILY/BACKLOG.md -- used on BOTH the operator hello (edge_ctl, me) and
+ * the cabinet hello (edge_client.exe, the founder's own machine): one real IDUNA identity now
+ * covers both roles, replacing two separate static shared secrets. Only attempted when g_jwt_key
+ * is set (EDGE_IDUNA_JWKS_FILE configured) -- real, named limitation: no "exp" check, one pinned
+ * key, no JWKS rotation (see jwt_verify.h's own header comment). */
+static int jwt_authorized(const char *token) {
     char perms[2000];
-    if (strcmp(token, g_operator_token) == 0) return 1;
     if (!g_jwt_key) return 0;
     if (!jwt_verify_es256(g_jwt_key, token, perms, (int)sizeof(perms))) return 0;
     return jwt_permissions_contains(perms, "edge.game.operator");
+}
+
+/* operator_token_authorized -- the static shared EDGE_OPERATOR_TOKEN (unchanged, back-compat) OR
+ * a real IDUNA JWT (see jwt_authorized above). */
+static int operator_token_authorized(const char *token) {
+    return strcmp(token, g_operator_token) == 0 || jwt_authorized(token);
 }
 
 static void device_or_operator_dispatch(int slot, const char *line) {
