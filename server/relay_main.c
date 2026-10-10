@@ -141,6 +141,8 @@ typedef struct {
     int fd;
     SecConn sec;
     time_t accepted;
+    time_t last_rx;   /* last time any bytes arrived: the liveness clock for the heartbeat reaper */
+    time_t last_hb;   /* last time the relay sent this cabinet a heartbeat ping */
     int authed;
     int host;
     int feather;
@@ -339,6 +341,32 @@ static void reap_unauthenticated(void) {
         if (op->in_use && !op->authed && now - op->accepted > g_handshake_deadline_s) {
             close(op->fd);
             op->in_use = 0;
+        }
+    }
+}
+
+/* Cabinet liveness. The cabinet client acks every id'd line (even unknown types), so the relay pings
+   each authed cabinet and drops one that has been silent past the deadline. Without this a PC that
+   slept or changed networks left a half-open socket that `hosts` kept reporting as connected while
+   every command timed out (found live 2026-10-10). The deadline is long enough that a blocking
+   client handler (a flash is ~20s; exec has no timeout) is not mistaken for a dead link. */
+static int g_hb_interval_s = 15;   /* EDGE_HEARTBEAT_INTERVAL_S overrides (tests use 1) */
+static int g_hb_dead_s = 90;       /* EDGE_HEARTBEAT_DEAD_S overrides (tests use 4) */
+static void heartbeat_cabinets(void) {
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_CABS; i++) {
+        Cabinet *c = &g_cabs[i];
+        if (!c->in_use || !c->authed) continue;
+        if (now - c->last_rx > g_hb_dead_s) {
+            fprintf(stderr, "[relay] cabinet silent for %lds -- dropping stale connection (host=%s)\n",
+                    (long)(now - c->last_rx), HOST_NAMES[c->host]);
+            close(c->fd);
+            c->in_use = 0;
+            continue;
+        }
+        if (now - c->last_hb >= g_hb_interval_s) {
+            send_line(c->fd, "{\"id\":\"hb\",\"type\":\"ping\"}");
+            c->last_hb = now;
         }
     }
 }
@@ -615,6 +643,8 @@ int main(void) {
     g_operator_token = getenv("EDGE_OPERATOR_TOKEN");
     g_pi_token = getenv("EDGE_PI_TOKEN");
     if (getenv("EDGE_HANDSHAKE_DEADLINE_S")) g_handshake_deadline_s = atoi(getenv("EDGE_HANDSHAKE_DEADLINE_S"));
+    if (getenv("EDGE_HEARTBEAT_INTERVAL_S")) g_hb_interval_s = atoi(getenv("EDGE_HEARTBEAT_INTERVAL_S"));
+    if (getenv("EDGE_HEARTBEAT_DEAD_S")) g_hb_dead_s = atoi(getenv("EDGE_HEARTBEAT_DEAD_S"));
     const char *timeout_s = getenv("EDGE_COMMAND_TIMEOUT_MS");
     g_command_timeout_s = timeout_s ? (atoi(timeout_s) + 999) / 1000 : 5;
     if (!g_client_token || !*g_client_token || !g_operator_token || !*g_operator_token) {
@@ -674,6 +704,7 @@ int main(void) {
 
         find_and_expire_pending();
         reap_unauthenticated();
+        heartbeat_cabinets();
 
         if (r == 0) continue;
 
@@ -687,7 +718,7 @@ int main(void) {
                     Cabinet *c = &g_cabs[cs];
                     memset(c, 0, sizeof(*c));
                     if (sec_server_begin(&c->sec, fd) < 0) { tcp_close_raw(fd); }
-                    else { c->fd = fd; c->accepted = time(NULL); c->in_use = 1; }
+                    else { c->fd = fd; c->accepted = c->last_rx = time(NULL); c->in_use = 1; }
                 }
             }
         }
@@ -713,6 +744,7 @@ int main(void) {
         for (int i = 0; i < MAX_CABS; i++) {
             Cabinet *c = &g_cabs[i];
             if (!c->in_use || !FD_ISSET(c->fd, &rfds)) continue;
+            c->last_rx = time(NULL);
             if (!pump(&c->sec, c->buf, &c->buflen, -(i + 1)) && c->in_use) {
                 fprintf(stderr, "[relay] cabinet disconnected (host=%s)\n", c->authed ? HOST_NAMES[c->host] : "?");
                 close(c->fd);

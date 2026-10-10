@@ -64,12 +64,12 @@ build:
 	mkdir -p build
 
 client: build build/libvendor.a
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) \
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
 		client/edge_client.c client/usb_probe.c client/serial_port.c client/avr109.c $(SEC_SRCS) build/libvendor.a -o build/edge_client -lm
 
 # edge-ctl -- the operator/device command-line tool (also what the Pi's boot announce and test-e2e use).
 edge-ctl: build build/libvendor.a
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) \
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -DPARENA_NO_GRAPHICS $(SEC_INC) $(SEC_DEFS) \
 		client/edge_ctl.c $(SEC_SRCS) build/libvendor.a -o build/edge_ctl -lm
 
 # client-windows -- real mingw cross-compile of the same edge_client.c (CI auto-release, S584
@@ -125,9 +125,9 @@ relay: build build/libvendor.a
 		server/tcp_llvm_gen.ll -o server/tcp_llvm_gen.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -c server/reflux_runtime.c -o server/reflux_runtime.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -c server/tcp_llvm_glue.c -o server/tcp_llvm_glue.o
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) -c server/relay_main.c -o server/relay_main.o
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -c common/sec_transport.c -o server/sec_transport.o
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -c client/runtime/parena_runtime.c -o server/parena_runtime.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) -DPARENA_NO_GRAPHICS -c server/relay_main.c -o server/relay_main.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -DPARENA_NO_GRAPHICS -c common/sec_transport.c -o server/sec_transport.o
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror $(SEC_INC) $(SEC_DEFS) -DPARENA_NO_GRAPHICS -c client/runtime/parena_runtime.c -o server/parena_runtime.o
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -Wno-deprecated-declarations -c common/jwt_verify.c -o server/jwt_verify.o
 	$(CC) -o build/edge_relay server/relay_main.o server/sec_transport.o server/parena_runtime.o \
 		server/reflux_runtime.o server/tcp_llvm_glue.o server/reflux_gen.o server/tcp_llvm_gen.o \

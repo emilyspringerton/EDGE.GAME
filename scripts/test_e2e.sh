@@ -34,6 +34,7 @@ RELAY_PID=""
 CLIENT_PID=""
 
 cleanup() {
+  [ -n "$CLIENT_PID" ] && kill -CONT "$CLIENT_PID" 2>/dev/null || true # a SIGSTOPped client ignores SIGTERM
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
   [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null || true
   wait 2>/dev/null || true
@@ -45,7 +46,7 @@ export EDGE_KEY_FILE="$WORKDIR/relay.key"
 cd "$WORKDIR" # edge_known_servers.txt (TOFU) lands here, not in the repo
 BIN="$OLDPWD/build"
 
-EDGE_HANDSHAKE_DEADLINE_S=2 EDGE_PI_TOKEN="$EDGE_PI_TOKEN" "$BIN/edge_relay" > "$RELAY_LOG" 2>&1 &
+EDGE_HANDSHAKE_DEADLINE_S=2 EDGE_HEARTBEAT_INTERVAL_S=1 EDGE_HEARTBEAT_DEAD_S=20 EDGE_PI_TOKEN="$EDGE_PI_TOKEN" "$BIN/edge_relay" > "$RELAY_LOG" 2>&1 &
 RELAY_PID=$!
 sleep 0.5
 PIN="$(sed -n 's/.*clients pin this): //p' "$RELAY_LOG")"
@@ -56,7 +57,7 @@ export EDGE_SERVER_PIN="$PIN"
 CLIENT_PID=$!
 sleep 0.5
 
-TESTS_DIR="$OLDPWD/tests" REPO_DIR="$OLDPWD" BIN="$BIN" PIN="$PIN" EDGE_OPERATOR_PORT="$EDGE_OPERATOR_PORT" EDGE_OPERATOR_TOKEN="$EDGE_OPERATOR_TOKEN" \
+CLIENT_PID="$CLIENT_PID" TESTS_DIR="$OLDPWD/tests" REPO_DIR="$OLDPWD" BIN="$BIN" PIN="$PIN" EDGE_OPERATOR_PORT="$EDGE_OPERATOR_PORT" EDGE_OPERATOR_TOKEN="$EDGE_OPERATOR_TOKEN" \
 EDGE_PI_TOKEN="$EDGE_PI_TOKEN" EDGE_CLIENT_PORT="$EDGE_CLIENT_PORT" python3 - <<'PYEOF'
 import json, os, select, socket, subprocess, sys, time
 
@@ -342,6 +343,29 @@ if os.path.exists(prn) and os.path.exists(PARENA + "/parena") and os.path.exists
 else:
     print("SKIP: edge_flash.sh end-to-end needs a sibling ../PARENA with parena built AND avr-gcc (AVR_TOOLCHAIN_ROOT)")
 sim2.stop = True
+
+# ---- cabinet heartbeat: a live client stays registered while idle; a frozen one is reaped ----
+import signal
+def hosts():
+    # fresh operator session each time: the long-lived `op` above is an `edge_ctl --follow 60` child
+    # and has expired by now (this test sleeps past the heartbeat deadline twice)
+    c = Conn(os.environ["EDGE_OPERATOR_TOKEN"])
+    try:
+        c.recv()  # hello_ok
+        c.send({"id": "hh", "type": "hosts"})
+        for _ in range(5):
+            m = json.loads(c.recv(3) or "{}")
+            if m.get("type") == "hosts": return m.get("items", [])
+        return None
+    finally:
+        c.close()
+time.sleep(22)  # > EDGE_HEARTBEAT_DEAD_S with no operator traffic: only heartbeat acks keep it alive
+check("an idle but live cabinet stays registered (heartbeat acks)", ["windows"], [h["host"] for h in (hosts() or [])])
+cpid = int(os.environ["CLIENT_PID"])
+os.kill(cpid, signal.SIGSTOP)  # a PC that slept / a half-open socket: connected, never answers
+time.sleep(23)
+check("a frozen cabinet is dropped from hosts (no stale 'connected')", [], hosts())
+os.kill(cpid, signal.SIGCONT)
 
 for c in (op, device, sub): c.close()
 sys.exit(1 if fail[0] else 0)

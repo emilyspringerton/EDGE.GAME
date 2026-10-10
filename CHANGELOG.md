@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-10
+- fix(client): the AVR109 flasher waited for an 8-byte `CATERINA` reply to `S`; a real Caterina bootloader answers the 7-byte `CATERIN`, so every real flash timed out at the handshake (the simulator had the same wrong string, so tests never caught it). Found on the founder's real Feather 32u4 (COM9 bootloader). Not yet re-verified on hardware.
+- feat(relay): cabinet heartbeat. The relay pings each authed cabinet every 15s (the client acks any id'd line) and drops one silent for 90s (`EDGE_HEARTBEAT_INTERVAL_S` / `EDGE_HEARTBEAT_DEAD_S`). Before this a PC that slept left a half-open socket that `hosts` reported as connected while every command timed out ("cabinet did not respond in time"). `make test-e2e` gains two checks (idle live cabinet stays; SIGSTOPped cabinet is dropped).
+- build: native `client`/`edge-ctl`/`relay` targets pass `-DPARENA_NO_GRAPHICS`, so they no longer need SDL2 headers (a headless server has no use for them).
+- deploy(CI): `ci.yml` builds + pushes the relay image on every green `main` push via Workload Identity (`scripts/build-image.sh`, tag = short SHA); `EMILY/gitops/watch-tags.sh` now maps `EDGE_RELAY_TAG` to `edge-relay` so the in-cluster autodeploy bumps and applies it. Repo variables `GCP_WIF_PROVIDER` / `GCP_CI_SERVICE_ACCOUNT` set on this repo.
+
 ## 2026-10-09 (cont. 4)
 - client: the console window no longer vanishes. On Windows, `edge_exit` writes the final status to the real console and waits for Enter (stdout/stderr go to edge_client.log). If the relay closes the connection before accepting the sign-in, it now says so (account probably lacks `edge.game.operator`, or the token was rejected) instead of a bare "connection closed". The sign-in URL now carries `logout=1` so IDUNA's SSO page cannot silently reuse a remembered pre-permissions token; every launch mints a fresh JWT with current permissions.
 

@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 # Serialize runs per ref: parallel pushes could both compute the same next tag and race each
 # other publishing it (DEADWEIGHT/D2 both hit this for real). Queued (not cancelled) so each run
@@ -59,11 +60,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # libsdl2-dev is needed even for this graphics-free client: the shared
-      # client/runtime/parena_runtime.h includes <SDL2/SDL.h> unconditionally by design
-      # ("unconditionally available, harmless if unused" -- PARENA_NO_GRAPHICS is opt-in only,
-      # see the header's own comment), and the native `client`/`relay` Makefile targets don't
-      # pass that flag.
+      # The native `client`/`edge-ctl`/`relay` Makefile targets pass -DPARENA_NO_GRAPHICS (the
+      # shared client/runtime/parena_runtime.h includes <SDL2/SDL.h> unless that is set), so SDL
+      # is not strictly needed any more; kept installed so a future real SDL2 window links.
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libsdl2-ttf-dev
 
@@ -91,6 +90,24 @@ jobs:
       - name: Run make test-e2e
         run: |
           AVR_TOOLCHAIN_ROOT=/ PARENA_ROOT="$PWD/PARENA" LLVM_TOOLCHAIN_ROOT=/ make test-e2e
+
+      # K8S-CD-01 auto-deploy (same pattern as WOTAN/IDUNA/DEADWEIGHT_2 deploy.yml): after the relay
+      # built and test-e2e passed, push the image tagged with the short SHA, auth via Workload
+      # Identity (no stored key; EMILY/gitops/CI_SETUP.md). The in-cluster gitops-autodeploy
+      # CronJob (watch-tags.sh, EDGE_RELAY_TAG) notices the newest `edge-relay` tag, bumps
+      # tags.env, and gitops-sync applies it -- this workflow never talks to the cluster.
+      - name: Auth to GCP (Workload Identity, no stored key)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+      - name: Set up gcloud
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Build + push relay image (auto-deploys via gitops)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: scripts/build-image.sh "$(git rev-parse --short HEAD)"
 
       - name: Generate Source Construct
         run: |
