@@ -102,11 +102,11 @@ int avr109_flash(SerialPort *sp, const unsigned char *image, int len, Avr109Prog
     while (serial_read(sp, tmp, sizeof(tmp)) > 0) {}
 
     if (serial_write(sp, (const unsigned char *)"S", 1) < 0) { snprintf(errbuf, errlen, "write failed"); return -1; }
-    if (read_exact(sp, id, 8, 2000) != 8 || memcmp(id, "CATERINA", 8) != 0) {
+    if (read_exact(sp, id, 7, 2000) != 7 || memcmp(id, "CATERIN", 7) != 0) {
         snprintf(errbuf, errlen, "no Caterina bootloader answered 'S' (is the Feather in bootloader mode? double-tap RESET)");
         return -1;
     }
-    PROG("bootloader: CATERINA");
+    PROG("bootloader: CATERIN");
     if (serial_write(sp, (const unsigned char *)"p", 1) < 0 || read_exact(sp, tmp, 1, 1000) != 1) { snprintf(errbuf, errlen, "no reply to programmer-type query"); return -1; }
     if (serial_write(sp, (const unsigned char *)"b", 1) < 0 || read_exact(sp, tmp, 3, 1000) != 3 || tmp[0] != 'Y') {
         snprintf(errbuf, errlen, "bootloader does not support block mode"); return -1;

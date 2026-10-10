@@ -21,7 +21,7 @@ class Sim(threading.Thread):
             c = self.rd(1)
             if not c or self.deaf: continue
             c = chr(c[0])
-            if c == "S": self.wr(b"CATERINA")
+            if c == "S": self.wr(b"CATERIN")
             elif c == "V": self.wr(b"10")
             elif c == "p": self.wr(b"S")
             elif c == "b": self.wr(b"Y\x00\x80")
